@@ -135,6 +135,18 @@ function update(snapshot) {
     (status.expiry ? " · expiry " + status.expiry : " · simulated clock") + " (UTC)");
   show("last-volume", received(status.last_volume_update));
   const recorder = status.recorder;
+  const quality = status.quality;
+  show("ops-session", quality.session_state + " · " + quality.market_observation_state);
+  show("ops-quality", quality.transport_gap_count + " transport gaps · " +
+    quality.mbp_recovery_count + " MBP recoveries");
+  show("ops-capture", status.recorder_error ? "FAILED · historical data only" : recorder.enabled ?
+    recorder.average_records_per_second.toFixed(0) + " records/s · backlog " +
+      recorder.backlog_records + " · peak " + recorder.high_water_records : "CAPTURE OFF");
+  const latencies = recorder.observation_to_commit_us;
+  show("ops-latency", latencies?.p95 != null ? "p50 " + (latencies.p50 / 1000).toFixed(1) +
+    " · p95 " + (latencies.p95 / 1000).toFixed(1) + " · p99 " + (latencies.p99 / 1000).toFixed(1) + " ms" : "UNAVAILABLE");
+  show("ops-research", quality.research_eligibility + " · " + quality.invalid_feature_windows +
+    " invalid windows" + (quality.missing_sources.length ? " · missing " + quality.missing_sources.join(", ") : ""));
   show("recorder", status.recorder_error ? "Capture failed · collector stopped" :
     recorder.enabled ? recorder.durable_events + " durable records" : "Capture off");
   show("issues", status.last_issue ? status.last_issue + " · " + status.counters[status.last_issue] : "—");

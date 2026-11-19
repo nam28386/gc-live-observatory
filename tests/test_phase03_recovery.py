@@ -39,7 +39,7 @@ def test_mock_depth_snap_when_peer_tears_down(caplog):
                    if record.levelno >= logging.ERROR)
 
 
-@pytest.mark.parametrize("response", ["valid", "late", "wrong_generation", "malformed", "disconnect"])
+@pytest.mark.parametrize("response", ["valid", "late", "wrong_generation", "malformed", "disconnect", "repeated_disconnect"])
 def test_recovery_reply_boundaries_and_reconnect(response):
     async def scenario():
         attempts = 0
@@ -57,7 +57,8 @@ def test_recovery_reply_boundaries_and_reconnect(response):
                 await socket.send(json.dumps({"stream": "comex.gcz6@depthraw", "data": event}))
             rpc = json.loads(await socket.recv())
             assert rpc["method"] == "depthSnap"
-            if response == "disconnect" and attempts == 1:
+            disconnects = 3 if response == "repeated_disconnect" else 1 if response == "disconnect" else 0
+            if attempts <= disconnects:
                 await socket.close()
                 return
             result = {"type": "Image", "gen": attempts, "seq": 2, "rows": [], "src": 1}
@@ -82,10 +83,11 @@ def test_recovery_reply_boundaries_and_reconnect(response):
                     await first_ready.wait()
                     while not (micro.depth.valid or micro.depth.state == "RECOVERY_FAILED"):
                         await asyncio.sleep(0.005)
-                if response in ("valid", "disconnect"):
-                    assert micro.depth.counts["recoveries"] == (2 if response == "disconnect" else 1)
-                    if response == "disconnect":
-                        assert attempts == 2 and any(g["reason"] == "transport" for g in micro.depth.gaps)
+                if response in ("valid", "disconnect", "repeated_disconnect"):
+                    expected = 4 if response == "repeated_disconnect" else 2 if response == "disconnect" else 1
+                    assert micro.depth.counts["recoveries"] == expected
+                    assert attempts == expected
+                    assert sum(g["reason"] == "transport" for g in micro.depth.gaps) == expected - 1
                 else:
                     assert not micro.depth.valid
                     assert micro.depth.counts["retry_exhausted"] == 1

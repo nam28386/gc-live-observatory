@@ -133,6 +133,7 @@ class DepthBook:
         self.last = None
         self.recovery_ns = None
         self.available = None
+        self.last_snapshot = None
         self.lost_through = -1
 
     @property
@@ -212,7 +213,7 @@ class DepthBook:
             for seq, delta in buffered:
                 if seq > self.seq:
                     self.apply(delta)
-            self.available = event.observed
+            self.available = self.last_snapshot = event.observed
             if self.valid and self.gaps and self.gaps[-1]["resumed"] is None:
                 resumed = self.last.observed
                 # Buffered observations preceded the RPC reply, so availability is the image or later.

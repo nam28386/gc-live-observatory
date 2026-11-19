@@ -6,6 +6,8 @@ param(
     [ValidateSet("A", "B", "C")][string]$Mode = "A",
     [switch]$MboEntitled,
     [switch]$Capture,
+    [int]$BatchSize = 32,
+    [string]$Calendar,
     [int]$RetentionDays = 7
 )
 $ErrorActionPreference = 'Stop'
@@ -16,7 +18,8 @@ New-Item -ItemType Directory -Force $runtime | Out-Null
 $stop = Join-Path $runtime "stop-$Port"
 if (Test-Path -LiteralPath $stop) { Remove-Item -LiteralPath $stop }
 $cli = @('-m', 'observatory', 'live', '--symbol', $Symbol, '--expiry', $Expiry,
-    '--mode', $Mode, '--gateway-port', $GatewayPort, '--port', $Port, '--stop-file', $stop)
+    '--mode', $Mode, '--batch-size', $BatchSize, '--gateway-port', $GatewayPort, '--port', $Port, '--stop-file', $stop)
+if ($Calendar) { $cli += @("--calendar", (Resolve-Path -LiteralPath $Calendar).Path) }
 if ($MboEntitled) { $cli += "--mbo-entitled" }
 if ($Capture) {
     $cli += @('--capture', (Join-Path $runtime 'live.sqlite'), '--retention-days', $RetentionDays)

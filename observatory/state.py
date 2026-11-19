@@ -188,6 +188,7 @@ class ObservatoryState:
                     self.last_bbo_change = ticker.observed
                 self.quote = quote
                 self.quote_in_session = ticker.observed
+                self.counters["eligible_bbo"] += 1
                 self.observe_market(ticker.observed)
         if ticker.volume_valid:
             value = (ticker.session_volume, ticker.volume_time_us)

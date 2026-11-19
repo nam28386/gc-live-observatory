@@ -1,8 +1,9 @@
-"""Reconstruct one capture session in durable journal order without a gateway."""
+"""Replay a fixed committed prefix in its original observation clock domain."""
 
-from contextlib import closing
 import argparse
+from contextlib import closing, contextmanager
 from decimal import Decimal
+from hashlib import sha256
 import json
 from pathlib import Path
 import sqlite3
@@ -17,32 +18,77 @@ def observation(fields):
     return Observation(int(fields["utc_ns"]), int(fields["monotonic_ns"]))
 
 
-def replay(path: Path, session: str, mode: str, limit: int):
+def canonical(value):
+    return json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False)
+
+
+@contextmanager
+def capture_prefix(path, session, through_id=None, *, strict=False):
     journal = Journal(path, {})
-    engine = None
+    with closing(sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True)) as db:
+        db.row_factory = sqlite3.Row
+        db.execute("BEGIN")  # Pin one WAL reader snapshot across pages and retention.
+        info = db.execute("SELECT provenance FROM sessions WHERE id = ?", (session,)).fetchone()
+        if not info:
+            raise ValueError("Unknown capture session")
+        bound = None
+        if db.execute("SELECT 1 FROM sqlite_schema WHERE name='capture_boundaries'").fetchone():
+            bound = db.execute("SELECT * FROM capture_boundaries WHERE session_id=?", (session,)).fetchone()
+        complete = bool(bound and bound["first_id"] is not None and not bound["pruned"])
+        maximum = db.execute("SELECT max(id) FROM records WHERE session_id=?", (session,)).fetchone()[0]
+        position = maximum if through_id is None else through_id
+        if position is not None and not db.execute(
+            "SELECT 1 FROM records WHERE id=? AND session_id=?", (position, session)
+        ).fetchone():
+            raise ValueError("Position is outside the retained capture session")
+        if complete and position is not None:
+            recorded = db.execute("SELECT count(*) FROM records WHERE session_id=? AND id<=?",
+                                  (session, position)).fetchone()[0]
+            complete = recorded == position - bound["first_id"] + 1
+        if strict and not complete:
+            raise ValueError("Capture prefix is unattested, pruned or incomplete")
+
+        def rows():
+            cursor = 0
+            while position:
+                batch = journal.history(cursor, 250, session_id=session, through_id=position, reader=db)
+                if not batch:
+                    break
+                yield from batch
+                cursor = batch[-1]["id"]
+
+        yield json.loads(info["provenance"]), position, complete, rows()
+
+
+def semantic(snapshot):
+    """Exclude runtime latency and entitlement assertions from market-state comparison."""
+    fields = {key: value for key, value in snapshot.items() if key != "diagnostics"}
+    fields["mbo"] = {key: value for key, value in fields["mbo"].items() if key != "entitlement"}
+    return json.loads(canonical(fields))
+
+
+def replay(path: Path, session: str, mode: str, limit: int, *, through_id=None, as_of=None, strict=False):
     last = None
     last_trade = None
     cursor = processed = 0
-    # A read-only SQLite URI avoids opening or modifying an arbitrary capture file.
-    with closing(sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True)) as db:
-        if not db.execute("SELECT 1 FROM sessions WHERE id = ?", (session,)).fetchone():
-            raise ValueError("Unknown capture session")
-    while processed < limit:
-        batch = journal.history(cursor, min(250, limit - processed), session_id=session, read_only=True)
-        if not batch:
-            break
-        for row in batch:
+    digest = sha256()
+    final_summary = None
+    with capture_prefix(path, session, through_id, strict=strict) as (source, position, complete, rows):
+        instrument = Instrument(source["exchange"], source["symbol"], source.get("expiry"))
+        initial_mode = source.get("capture_config", {}).get("mode", mode)
+        engine = Microstructure(initial_mode, instrument, source["source"],
+                                source.get("stale_after_ns", 3_000_000_000))
+        engine.capture_id = session
+        for row in rows:
+            if processed == limit:
+                break
             cursor = row["id"]
             processed += 1
-            source = row["provenance"]
-            if engine is None:
-                instrument = Instrument(source["exchange"], source["symbol"], source.get("expiry"))
-                engine = Microstructure(mode, instrument, source["source"],
-                                        source.get("stale_after_ns", 3_000_000_000))
-                engine.capture_id = session
-            payload = row["payload"]
-            kind = row["kind"]
-            if kind in ("ack", "gap"):
+            digest.update((canonical(row) + "\n").encode())
+            payload, kind = row["payload"], row["kind"]
+            if kind == "capture_summary":
+                final_summary = payload
+            elif kind in ("ack", "gap"):
                 clocks = payload.get("observed")
                 if clocks:
                     last = observation(clocks)
@@ -50,35 +96,51 @@ def replay(path: Path, session: str, mode: str, limit: int):
                         engine.connect(last)
                     else:
                         engine.disconnect(last)
-                continue
-            if kind == "mbp_gap":
-                if engine.depth and payload["reason"] in ("malformed_mbp", "snapshot_timeout"):
-                    last = observation(payload["detected"])
-                    engine.depth.invalidate(payload["reason"], last)
+                        engine.last_time = last.monotonic_ns
+            elif kind == "mbp_gap" and engine.depth and payload["reason"] in ("malformed_mbp", "snapshot_timeout"):
+                last = observation(payload["detected"])
+                engine.depth.invalidate(payload["reason"], last)
+                if payload["reason"] == "malformed_mbp":
                     engine.advance(last)
-                continue
-            if kind not in ("trade", "bbo", "mbp", "depth_snapshot", "mbo"):
-                continue
-            last = observation(payload["event"]["observed"])
-            if not engine.transport:
-                engine.connect(last)
-            raw = json.loads(payload["raw"], parse_float=Decimal)
-            if kind == "trade" or kind == "bbo":
-                event = parse_event(raw, instrument, last, source["source"])
-                if isinstance(event, Trade):
-                    if not event.conditional and (last_trade is None or event.exchange_time_ms >= last_trade):
-                        last_trade = event.exchange_time_ms
-                        engine.trade(event)
-                else:
-                    engine.quote(event)
-            elif kind == "mbo" and engine.orders:
-                engine.order_event(parse_order(raw["data"], last))
-            elif kind in ("mbp", "depth_snapshot") and engine.depth:
-                data = raw["result"] if kind == "depth_snapshot" else raw["data"]
-                engine.depth_event(parse_depth(data, last), snapshot=kind == "depth_snapshot")
+            elif kind == "mbp_control" and engine.depth:
+                engine.depth.state = payload["state"]
+                engine.depth.counts.update(payload.get("increment", {}))
+            elif kind == "mbo_continuity" and engine.orders:
+                engine.orders.status = payload["reason"]
+            elif kind == "mode_transition":
+                engine.mode = payload["mode"]
+                engine.orders = None
+                if engine.mode == "A":
+                    engine.depth = None
+            elif kind in ("trade", "bbo", "mbp", "depth_snapshot", "mbo"):
+                last = observation(payload["event"]["observed"])
+                if not engine.transport:
+                    engine.connect(last)
+                raw = json.loads(payload["raw"], parse_float=Decimal)
+                if kind in ("trade", "bbo"):
+                    event = parse_event(raw, instrument, last, source["source"])
+                    if isinstance(event, Trade):
+                        if not event.conditional and (last_trade is None or event.exchange_time_ms >= last_trade):
+                            last_trade = event.exchange_time_ms
+                            engine.trade(event)
+                    else:
+                        engine.quote(event)
+                elif kind == "mbo" and engine.orders:
+                    engine.order_event(parse_order(raw["data"], last))
+                elif kind in ("mbp", "depth_snapshot") and engine.depth:
+                    data = raw["result"] if kind == "depth_snapshot" else raw["data"]
+                    engine.depth_event(parse_depth(data, last), snapshot=kind == "depth_snapshot")
             engine.durable_cards.clear()
-    return {"records_processed": processed, "after": cursor, "cap_reached": processed == limit,
-            "snapshot": engine.snapshot(last) if engine and last else None}
+    finished = cursor == position
+    if strict and not finished:
+        raise ValueError("Replay limit truncated the requested capture prefix")
+    if as_of is not None:
+        if not finished or (last and as_of.monotonic_ns < last.monotonic_ns):
+            raise ValueError("Replay clock falls before the resolved capture position")
+        last = as_of
+    return {"records_processed": processed, "after": cursor, "cap_reached": not finished and processed == limit,
+            "prefix_complete": complete and finished, "sha256": digest.hexdigest(), "capture_summary": final_summary,
+            "snapshot": engine.snapshot(last) if last else None}
 
 
 def main():
@@ -87,11 +149,14 @@ def main():
     cli.add_argument("session")
     cli.add_argument("--mode", choices=("A", "B", "C"), default="C")
     cli.add_argument("--limit", type=int, default=100_000)
+    cli.add_argument("--through-id", type=int)
+    cli.add_argument("--strict", action="store_true")
     args = cli.parse_args()
     if not 1 <= args.limit <= 1_000_000:
         cli.error("--limit must be between 1 and 1000000")
     try:
-        print(json.dumps(replay(args.database, args.session, args.mode, args.limit), indent=2))
+        print(json.dumps(replay(args.database, args.session, args.mode, args.limit,
+                                through_id=args.through_id, strict=args.strict), indent=2))
     except (OSError, ValueError, sqlite3.Error) as exc:
         cli.exit(1, f"Replay failed: {exc}\n")
 

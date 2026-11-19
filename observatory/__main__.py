@@ -12,6 +12,7 @@ from websockets.asyncio.client import connect
 from websockets.exceptions import WebSocketException
 
 from .config import gc_contract
+from .quality import SessionCalendar
 from .web import create_app
 
 
@@ -74,6 +75,7 @@ def main() -> None:
     live.add_argument("--gateway-port", type=int, default=9001)
     live.add_argument("--stale-after", type=float, default=10)
     live.add_argument("--stop-file", type=Path)
+    live.add_argument("--calendar", type=Path, help="local sourced COMEX GC session interval registry")
     live.add_argument("--mbo-entitled", action="store_true", help="operator's positive local mboProbe result")
     mbo_probe = subcommands.add_parser("mbo-probe", help="verify DBO entitlement from the Windows gateway")
     mbo_probe.add_argument("--symbol", required=True)
@@ -83,6 +85,7 @@ def main() -> None:
         command.add_argument("--mode", choices=("A", "B", "C"), default="A")
         command.add_argument("--port", default=8000, type=int)
         command.add_argument("--capture", type=Path, help="opt-in journal database outside all Git checkouts")
+        command.add_argument("--batch-size", type=int, choices=range(1, 65), default=32, metavar="1..64")
         command.add_argument("--retention-days", type=int, default=7)
     args = parser.parse_args()
     if args.command == "mbo-probe":
@@ -100,7 +103,7 @@ def main() -> None:
         parser.error("--retention-days must be positive")
     try:
         capture = local_path(args.capture) if args.capture else None
-        options = dict(capture_path=capture, retention_days=args.retention_days, mode=args.mode)
+        options = dict(capture_path=capture, retention_days=args.retention_days, mode=args.mode, batch_size=args.batch_size)
         stop_file = None
         if args.command == "mock":
             if not math.isfinite(args.interval) or args.interval <= 0:
@@ -120,8 +123,9 @@ def main() -> None:
                 parser.error("The stop marker already exists")
             app = create_app(instrument=gc_contract(args.symbol, args.expiry),
                              live_gateway_port=args.gateway_port, stale_after=args.stale_after,
-                             mbo_entitled=args.mbo_entitled, **options)
-    except ValueError as exc:
+                             mbo_entitled=args.mbo_entitled, calendar=SessionCalendar.load(args.calendar) if args.calendar else None,
+                             **options)
+    except (OSError, ValueError) as exc:
         parser.error(str(exc))
     config = uvicorn.Config(
         app, host="127.0.0.1", port=args.port, ws="websockets-sansio",

@@ -1,6 +1,8 @@
 """Loopback FastAPI app wired to the synthetic gateway and collector."""
 
 import asyncio
+from functools import lru_cache
+import subprocess
 from contextlib import AsyncExitStack, asynccontextmanager, suppress
 from pathlib import Path
 
@@ -15,8 +17,21 @@ from .journal import Journal, JournalError
 from .microstructure import Microstructure
 from .mock_gateway import MockGateway
 from .state import ObservatoryState
+from .quality import SessionCalendar, registry, summarize
 
 STATIC = Path(__file__).with_name("static")
+
+
+@lru_cache(maxsize=1)
+def software_revision():
+    try:
+        output = subprocess.check_output(
+            ["git", "rev-parse", "HEAD"], cwd=STATIC.parent.parent,
+            stderr=subprocess.DEVNULL, text=True, timeout=2,
+        ).strip()
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return output if len(output) == 40 and all(c in "0123456789abcdef" for c in output) else None
 
 
 def create_app(
@@ -24,20 +39,29 @@ def create_app(
     instrument: Instrument = MOCK_GC, live_gateway_port: int | None = None,
     capture_path: Path | None = None, retention_days: int = 7,
     stale_after: float = 3.0, mode: str = "A", mbo_entitled: bool = False,
+    mock_gateway: MockGateway | None = None, batch_size: int = 32,
+    calendar: SessionCalendar | None = None,
 ) -> FastAPI:
+    if not 1 <= batch_size <= 64:
+        raise ValueError("Capture batch size must be 1–64")
     live = live_gateway_port is not None
     if mode not in ("A", "B", "C"):
         raise ValueError("Unknown market data mode")
     requested_mode = mode
     if live and mode == "C" and not mbo_entitled:
         mode = "B"
+    instrument_registry = registry(instrument, calendar)
     state = ObservatoryState(instrument, stale_after=stale_after, live=live)
     journal = Journal(capture_path, {
         "source": state.source, "exchange": instrument.exchange,
         "symbol": instrument.symbol, "expiry": instrument.expiry,
-        "measurement_schema_version": 2, "stale_after_ns": state.stale_after_ns,
+        "measurement_schema_version": 3, "stale_after_ns": state.stale_after_ns,
+        "software_revision": software_revision(), "instrument_registry": instrument_registry,
+        "timestamp_contract": "utc_ns and process monotonic_ns; source clocks per instrument contract",
+        "capture_config": {"mode": mode, "batch_size": batch_size, "durability": "SQLite WAL FULL",
+                           "retention_days": retention_days, "batch_residence_ms": 4},
         "protocol_revision": "581cb6b3706c93ccd1667b32234e904654a44728",
-    }, retention_days) if capture_path is not None else None
+    }, retention_days, batch_size=batch_size) if capture_path is not None else None
 
     micro = Microstructure(mode, instrument, state.source, state.stale_after_ns)
     if mode == "C":
@@ -45,7 +69,7 @@ def create_app(
     elif requested_mode == "C":
         micro.entitlement = "UNVERIFIED"
     micro.capture_id = journal.session if journal else None
-    started = Observation.now().monotonic_ns
+    started = Observation.now()
 
     @asynccontextmanager
     async def lifespan(_: FastAPI):
@@ -55,35 +79,75 @@ def create_app(
             if live:
                 endpoint = f"ws://127.0.0.1:{live_gateway_port}/"
             else:
-                gateway = MockGateway(instrument, interval, disconnect_after, mode=mode)
+                gateway = mock_gateway or MockGateway(instrument, interval, disconnect_after, mode=mode)
                 endpoint = await stack.enter_async_context(gateway.running())
-            collector = asyncio.create_task(Collector(endpoint, state, journal=journal, micro=micro).run())
+            app.state.collector = Collector(endpoint, state, journal=journal, micro=micro)
+            collector = asyncio.create_task(app.state.collector.run())
             try:
                 yield
             finally:
                 collector.cancel()
                 with suppress(asyncio.CancelledError):
                     await collector
+                if journal and not journal.publication_failed:
+                    now = Observation.now()
+                    ended = state.status(now)
+                    ended["requested_market_data_mode"] = requested_mode
+                    conclusion = summarize(state, ended, micro, now, started, calendar,
+                                           journal.diagnostics(now.monotonic_ns))
+                    conclusion["freshness_samples"] = app.state.collector.freshness_samples
+                    await journal.append("capture_summary", now.utc_ns, conclusion)
 
     async def current_snapshot(*, full: bool) -> dict:
+        if journal:
+            backlog = len(journal.staged or ())
+            async with journal.visibility:
+                snapshot = capture_snapshot(full=full)
+            status = snapshot["status"]
+            status["recorder"]["backlog_records"] = backlog
+            status["quality"]["local_pressure_observed"] = backlog > 0
+            return snapshot
+        return capture_snapshot(full=full)
+
+    def capture_snapshot(*, full: bool) -> dict:
         now = Observation.now()
-        snapshot = state.snapshot(now) if full else {"status": state.status(now)}
+        failed = journal is not None and journal.publication_failed
+        source_state = ObservatoryState(instrument, stale_after=stale_after, live=live) if failed else state
+        if failed:
+            source_state.recorder_error = True
+            source_state.issue("capture_publication_invalid")
+
+        snapshot = source_state.snapshot(now) if full else {"status": source_state.status(now)}
         status = snapshot["status"]
+        agent = app.state.collector
+        status["receiver"] = {"incoming_frames": agent.incoming_frames, "decoded_frames": agent.decoded_frames,
+                              "ingest_high_water_frames": agent.ingest_high_water_frames}
         status["market_data_mode"] = micro.mode
         status["requested_market_data_mode"] = requested_mode
-        status["mbp_status"] = micro.depth.state if micro.depth else "DISABLED"
+        status["mbp_status"] = "INVALID" if failed else micro.depth.state if micro.depth else "DISABLED"
         status["mbo_entitlement"] = micro.entitlement
+        source_micro = Microstructure(mode, instrument, source_state.source) if failed else micro
         if full:
-            snapshot["microstructure"] = micro.snapshot(now)
+            snapshot["microstructure"] = source_micro.snapshot(now)
+            if journal and not failed:
+                snapshot["capture_checkpoint"] = {"session_id": journal.session,
+                                                  "durable_position": journal.last_record_id,
+                                                  "as_of": now.wire(), "mode": micro.mode}
         status["recorder"] = {
+            **(journal.diagnostics(now.monotonic_ns) if journal else {}),
             "enabled": journal is not None,
             "session_id": journal.session if journal else None,
             "durable_events": journal.written if journal else 0,
             "failures": journal.failures if journal else 0,
             "average_records_per_second": (
-                journal.written * 1e9 / max(1, now.monotonic_ns - started) if journal else None
+                journal.written * 1e9 / max(1, now.monotonic_ns - started.monotonic_ns) if journal else None
             ),
         }
+        status["software_revision"] = software_revision()
+        status["instrument_registry"] = instrument_registry
+        status["quality"] = summarize(source_state, status, source_micro, now, started, calendar, status["recorder"])
+        status["quality"]["freshness_samples"] = agent.freshness_samples
+        status["quality"]["freshness_sample_basis"] = "arriving frames, at most ten samples per second"
         return snapshot
 
     app = FastAPI(lifespan=lifespan, docs_url=None, redoc_url=None, openapi_url=None)

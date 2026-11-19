@@ -37,7 +37,7 @@ def app_url(tmp_path, mode):
                     time.sleep(0.025)
                 else:
                     log.seek(0)
-                    pytest.fail(f"MOCK launcher failed to start:\n{log.read()}")
+                    pytest.fail(f"MOCK launcher failed to start:\n{log.read(12000)}")
             yield url
         finally:
             process.terminate()
@@ -66,6 +66,10 @@ def test_every_canvas_updates_from_mock_websocket_and_gap_is_visible(app_url, mo
         expect(page.get_by_text("MOCK / SYNTHETIC")).to_be_visible()
         expect(page.locator("#instrument")).to_contain_text("COMEX · GCZ6")
         expect(page.locator("#spread")).to_have_text("2 ticks")
+        expect(page.get_by_label("Capture operations")).to_be_visible()
+        expect(page.locator("#ops-capture")).to_contain_text("backlog")
+        expect(page.locator("#ops-session")).to_contain_text("UNKNOWN")
+        expect(page.locator("#ops-latency")).to_contain_text("p95")
         expect(page.locator("#ack")).to_have_text(f"Acknowledged #{3 if mode == 'C' else 2}", timeout=10_000)
         expect(page.locator("#gaps")).to_have_text("1 · historical gaps retained")
         expect(page.locator("#recorder")).to_contain_text("durable records")

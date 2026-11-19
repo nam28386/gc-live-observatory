@@ -61,6 +61,7 @@ class Candidate:
     invalid: bool = False
     cutoff_recorded: bool = False
     terminal: bool = False
+    last_refill: int | None = None
 
 
 class Microstructure:
@@ -92,7 +93,9 @@ class Microstructure:
         self.last_intensity_check = None
         self.cvd = 0
         self.processed = 0
-        self.processing_ns = deque(maxlen=256)
+        self.invalid_windows = 0
+        self.processing_ns = deque(maxlen=4096)
+        self.availability_ns = deque(maxlen=4096)
 
     def connect(self, observed):
         self.transport = True
@@ -167,6 +170,7 @@ class Microstructure:
     def finish_invalid(self, observed, reason):
         c = self.active
         c.invalid = c.terminal = True
+        self.invalid_windows += 1
         c.card["status"] = "INELIGIBLE"
         c.card["end"] = observed.wire()
         c.card["missing_evidence"].append(reason)
@@ -182,9 +186,12 @@ class Microstructure:
         c.card["status"] = "ELIGIBLE_AT_CUTOFF" if usable else "INELIGIBLE"
         c.invalid = not usable
         if not usable:
+            self.invalid_windows += 1
             c.card["missing_evidence"].append("fresh BBO, anchored depth or continuous MBP coverage")
         c.card["prediction"] = {
             "cutoff_receive_ns": str(c.start + WINDOW),
+            "impact_sample_receive_ns": str(c.mid2[0]) if usable else None,
+            "last_refill_observation_receive_ns": str(c.last_refill) if usable and c.last_refill is not None else None,
             "available_receive_ns": str(self.last_time),
             "impact_ticks": c.direction * (c.mid2[1] - c.initial_mid) if usable else None,
             "refill_contracts": c.refill[side] if usable else None,
@@ -340,6 +347,7 @@ class Microstructure:
             key = side, price
             if c and not c.terminal and key in c.anchors and stamp <= c.start + WINDOW:
                 c.current[key] = size
+                c.last_refill = stamp
                 c.refill[side] += max(0, size - old_size)
                 c.depletion[side] += max(0, old_size - size)
                 if c.depletion[side] and c.recovered_at is None and size > old_size and (
@@ -399,9 +407,15 @@ class Microstructure:
         )
         counts = Counter(category for seen, category in self.events if seen >= stamp - WINDOW)
         latencies = sorted(self.processing_ns)
+        availability = sorted(self.availability_ns)
+        def percentiles(samples):
+            return {f"p{p}": samples[(len(samples) - 1) * p // 100] / 1000 if samples else None
+                    for p in (50, 95, 99)}
         return {
             "diagnostics": {
                 "stream_frames_processed": self.processed,
+                "processing_us": percentiles(latencies),
+                "observation_to_availability_us": percentiles(availability),
                 "processing_p95_us": latencies[int((len(latencies) - 1) * .95)] / 1000 if latencies else None,
                 "measurement_overflow": {name: stamp < until for name, until in self.saturated_until.items()},
             },
