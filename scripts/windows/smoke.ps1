@@ -3,6 +3,7 @@ param(
     [Parameter(Mandatory=$true)][string]$Expiry,
     [int]$GatewayPort = 9001,
     [int]$Port = 8000,
+    [ValidateSet("A", "B", "C")][string]$Mode = "A",
     [int]$TimeoutSeconds = 45
 )
 $ErrorActionPreference = 'Stop'
@@ -15,6 +16,9 @@ do {
     $s = $data.status
     if ($s.mode -ne 'LIVE' -or $s.exchange -ne 'COMEX' -or
         $s.symbol -ne $Symbol -or $s.expiry -ne $Expiry) { throw 'Unexpected mode or contract' }
+    if ($s.market_data_mode -ne $Mode) {
+        throw "Requested validation mode $Mode differs from effective mode $($s.market_data_mode)"
+    }
     if ($s.recorder_error) { throw 'Recorder unavailable' }
     if ($s.transport_connected -and $s.subscribe_ack -and $null -ne $s.request_id -and
         $s.request_id -eq $s.last_ack_request_id -and
@@ -23,6 +27,17 @@ do {
         $s.quote_timestamp_basis -eq 'collector_observation' -and
         [long]$s.last_eligible_trade.utc_ns -gt [long]$initial.status.last_eligible_trade.utc_ns -and
         [long]$s.last_bbo_message.utc_ns -gt [long]$initial.status.last_bbo_message.utc_ns) {
+        if ($Mode -ne "A" -and ($data.microstructure.liquidity.status -ne "VALID" -or
+            ($data.microstructure.mbp.generation -eq $initial.microstructure.mbp.generation -and
+             $data.microstructure.mbp.sequence -le $initial.microstructure.mbp.sequence))) {
+            Start-Sleep -Milliseconds 300
+            continue
+        }
+        if ($Mode -eq "C" -and ($s.mbo_entitlement -ne "OPERATOR_REPORTED" -or
+            $data.microstructure.mbo.status -ne "OBSERVED_PARTIAL_BOOK")) {
+            Start-Sleep -Milliseconds 300
+            continue
+        }
         $age = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() - [long]$data.trade.exchange_time_ms
         if ($age -lt -5000 -or $age -gt 120000 -or
             ($null -ne $data.trade.match_time_us -and [long]$data.trade.match_time_us -lt 1000000000000000) -or

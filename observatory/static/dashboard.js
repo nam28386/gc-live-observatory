@@ -5,6 +5,8 @@ const time = new Intl.DateTimeFormat("en-GB", {
   hour: "2-digit", minute: "2-digit", timeZone: "UTC",
 });
 let currentSnapshot;
+let cursorTime = null;
+let cards = [];
 let lastTimelineRefresh = 0;
 
 function show(id, text) {
@@ -62,6 +64,9 @@ function draw(panel, bars, tickSize) {
   const chartTop = 16;
   const chartBottom = height - 29;
   const step = (right - left) / slots;
+  canvas.dataset.rangeStart = first;
+  canvas.dataset.rangeDuration = duration;
+  canvas.dataset.rangeStep = step;
   const y = ticks => chartTop + (highest - ticks) * (chartBottom - chartTop) / (highest - lowest);
 
   ctx.strokeStyle = "#343f44";
@@ -80,6 +85,10 @@ function draw(panel, bars, tickSize) {
     const bodyTop = Math.min(y(bar.open_ticks), y(bar.close_ticks));
     const bodyHeight = Math.max(1.5, Math.abs(y(bar.open_ticks) - y(bar.close_ticks)));
     const halfWidth = Math.max(2, step * 0.3);
+    if (bar.partial) {
+      ctx.fillStyle = "#f0c5771a";
+      ctx.fillRect(x - step / 2, chartTop, step, chartBottom - chartTop);
+    }
     ctx.strokeStyle = ctx.fillStyle = bar.close_ticks >= bar.open_ticks ? "#79d4b1" : "#ef988b";
     ctx.beginPath();
     ctx.moveTo(x, y(bar.high_ticks));
@@ -92,6 +101,25 @@ function draw(panel, bars, tickSize) {
     }
   }
 
+  for (const card of cards) {
+    const sourceTime = card.trade_exchange_ms;
+    if (!(sourceTime >= first && sourceTime < last.end_ms)) continue;
+    const x = left + (sourceTime - first) / duration * step;
+    ctx.fillStyle = "#f0c577";
+    ctx.beginPath();
+    ctx.arc(x, chartTop + 3, 3, 0, 2 * Math.PI);
+    ctx.fill();
+  }
+  if (cursorTime !== null && cursorTime >= first && cursorTime < last.end_ms) {
+    const x = left + (cursorTime - first) / duration * step;
+    ctx.strokeStyle = "#9ca9ab";
+    ctx.beginPath();
+    ctx.moveTo(x, chartTop);
+    ctx.lineTo(x, chartBottom);
+    ctx.stroke();
+    ctx.fillStyle = "#ebeee9";
+    ctx.fillText(time.format(cursorTime) + " UTC", Math.min(x + 3, right - 45), chartTop + 16);
+  }
   ctx.fillStyle = "#a9b4b8";
   ctx.fillText(time.format(first), left, height - 8);
   ctx.textAlign = "right";
@@ -133,6 +161,7 @@ function update(snapshot) {
   const openGap = status.gaps.some(gap => !gap.resumed);
   show("gaps", count + (openGap ? " · open gap" : count ? " · historical gaps retained" : ""));
   document.getElementById("gaps").classList.toggle("warning", count > 0);
+  renderMicrostructure(snapshot.microstructure);
   for (const panel of panels) draw(panel, snapshot.candles[panel.dataset.frame], tickSize);
 }
 
@@ -145,7 +174,8 @@ async function refreshTimeline() {
     if (!response.ok) throw new Error("Capture history unavailable");
     const { records } = await response.json();
     const labels = { gap: "Capture interrupted", restart_gap: "Recorder restarted",
-      coverage_start: "Market data observed" };
+      coverage_start: "Market data observed", mbp_gap: "MBP gap", mbp_recovery: "MBP snapshot recovered",
+      mbp_overflow: "MBP recovery buffer overflow", mbo_continuity: "MBO continuity invalidated" };
     list.replaceChildren(...records.map(record => {
       const row = document.createElement("li");
       const start = record.payload.from_utc_ns;
@@ -160,6 +190,72 @@ async function refreshTimeline() {
     row.textContent = "Capture history unavailable";
     list.replaceChildren(row);
   }
+}
+
+function renderMicrostructure(micro) {
+  if (!micro) return;
+  const { trade_flow: flow, ofi, mbp, mbo, liquidity, intensity } = micro;
+  const latestGap = mbp.gaps?.at(-1);
+  show("depth-health", "Mode " + micro.mode + " · MBP " + mbp.status +
+    (mbp.generation !== undefined ? " · gen " + (mbp.generation ?? "—") +
+      " / seq " + (mbp.sequence ?? "—") : "") +
+    (latestGap ? " · gap retained (" + latestGap.reason + ")" : ""));
+  show("micro-flow", flow.status + " · 2s buy " + flow.buy + " / sell " + flow.sell +
+    " / net " + flow.net + " · unknown " + flow.unknown);
+  show("micro-ofi", ofi.status + (ofi.ranks ? " · best " + ofi.best_level +
+    " · top five " + ofi.multi_level + " · " + ofi.count + " updates" : ""));
+  show("micro-liquidity", liquidity.status + (liquidity.top_n_depth ?
+    " · bid " + liquidity.top_n_depth[0] + " / ask " + liquidity.top_n_depth[1] +
+    " · " + liquidity.spread_ticks + " ticks" +
+    (liquidity.bbo_disagreement === true ? " · BBO disagreement" : "") : ""));
+  show("micro-mbo", mbo.status + " · " + mbo.entitlement +
+    (mbo.order_count === null ? "" : " · " + mbo.order_count + " observed orders · " +
+      (mbo.counts.exact_fill || 0) + " exact / " + (mbo.counts.inferred_fill || 0) + " inferred fills"));
+  const rates = Object.entries(intensity.rates_per_second).map(([name, rate]) =>
+    name.replaceAll("_", " ") + " " + rate + "/s");
+  const latency = micro.diagnostics.processing_p95_us;
+  show("micro-intensity", [intensity.status, ...rates.slice(0, 6),
+    ...(latency === null ? [] : ["processing p95 " + latency.toFixed(0) + " µs"])].join(" · "));
+  cards = micro.evidence;
+  const burst = [...cards].reverse().find(card => card.category === "aggressive_flow_burst");
+  show("micro-refill", burst ? burst.status +
+    (burst.prediction?.refill_contracts != null ? " · anchored refill " +
+      burst.prediction.refill_contracts + " contracts" : "") : "AWAITING ELIGIBLE EVENT");
+  show("evidence-count", cards.length ? "(" + cards.length + ")" : "");
+  const select = document.getElementById("evidence-select");
+  const ids = cards.map(card => card.id).join(",");
+  if (select.dataset.ids !== ids) {
+    const selected = select.value;
+    select.dataset.ids = ids;
+    select.replaceChildren(...(cards.length ? [...cards].reverse().map(card =>
+      new Option(card.category.replaceAll("_", " ") + " · " + received(card.start), card.id)
+    ) : [new Option("No candidates", "")]));
+    if (cards.some(card => card.id === selected)) select.value = selected;
+  }
+  showEvidence();
+}
+
+function showEvidence() {
+  const id = document.getElementById("evidence-select").value;
+  const card = cards.find(item => item.id === id);
+  show("evidence-card", card ? JSON.stringify(card, null, 2) : "");
+}
+
+document.getElementById("evidence-select").addEventListener("change", showEvidence);
+for (const panel of panels) {
+  const canvas = panel.querySelector("canvas");
+  canvas.addEventListener("pointermove", event => {
+    if (!currentSnapshot || !canvas.dataset.rangeStep) return;
+    const x = event.clientX - canvas.getBoundingClientRect().left;
+    cursorTime = Number(canvas.dataset.rangeStart) +
+      ((x - 12) / Number(canvas.dataset.rangeStep)) * Number(canvas.dataset.rangeDuration);
+    const size = Number(currentSnapshot.status.tick_size);
+    for (const item of panels) draw(item, currentSnapshot.candles[item.dataset.frame], size);
+  });
+  canvas.addEventListener("pointerleave", () => {
+    cursorTime = null;
+    if (currentSnapshot) update(currentSnapshot);
+  });
 }
 
 function connect() {

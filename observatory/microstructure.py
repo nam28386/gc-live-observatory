@@ -86,6 +86,13 @@ class Microstructure:
         self.depth_coverage_since = None
         self.previous_valid = False
         self.transport = False
+        self.last_detection = {}
+        self.samples = deque()
+        self.last_trade_seen = None
+        self.last_intensity_check = None
+        self.cvd = 0
+        self.processed = 0
+        self.processing_ns = deque(maxlen=256)
 
     def connect(self, observed):
         self.transport = True
@@ -94,8 +101,9 @@ class Microstructure:
 
     def disconnect(self, observed):
         self.transport = False
-        self.mid = self.bbo = None
+        self.mid = self.bbo = self.last_trade_seen = None
         self.events.clear()
+        self.samples.clear()
         self.ofi.clear()
         self.flow.clear()
         self.depth_coverage_since = None
@@ -120,13 +128,26 @@ class Microstructure:
         if self.last_time is not None and stamp < self.last_time:
             return False
         self.last_time = stamp
+        if not self.samples or stamp - self.samples[-1][0] >= SECOND // 10:
+            self.append("samples", (stamp, self.depth_eligible(stamp)))
+        if self.last_intensity_check is None or stamp - self.last_intensity_check >= SECOND // 4:
+            self.last_intensity_check = stamp
+            if stamp >= self.saturated_until.get("events", 0):
+                rates = Counter(category for seen, category in self.events if seen >= stamp - SECOND)
+                if rates:
+                    category, count = rates.most_common(1)[0]
+                    if count >= 100:
+                        self.detect("high_observed_event_intensity", observed,
+                                    {"event_category": category, "count_1s": count})
         c = self.active
         if c and not c.terminal:
             elapsed = stamp - c.start
             if self.depth and (c.epoch != self.depth.epoch or not self.depth_eligible(stamp)):
                 self.finish_invalid(observed, "MBP coverage interrupted")
+            elif self.mid and stamp - self.mid[0] > self.freshness_ns:
+                self.finish_invalid(observed, "BBO freshness interrupted")
             elif elapsed > WINDOW and not c.cutoff_recorded:
-                self.cutoff(c)
+                self.cutoff(c, observed)
             if not c.terminal and elapsed > 30 * SECOND:
                 sample = c.mid30
                 if sample and self.transport and stamp - c.start >= 30 * SECOND and (
@@ -152,7 +173,7 @@ class Microstructure:
         c.card["label"] = None
         self.durable_cards.append({**c.card, "missing_evidence": list(c.card["missing_evidence"]), "phase": "invalidation"})
 
-    def cutoff(self, c):
+    def cutoff(self, c, observed):
         c.cutoff_recorded = True
         side = "S" if c.direction > 0 else "B"
         opposite = "B" if side == "S" else "S"
@@ -179,11 +200,23 @@ class Microstructure:
             ),
         }
         self.durable_cards.append({**c.card, "missing_evidence": list(c.card["missing_evidence"]), "phase": "prediction"})
+        if usable:
+            facts = {"parent_event": c.card["id"], "signed_contracts_1s": c.signed_at_start,
+                     **c.card["prediction"]}
+            if c.refill[side] >= 8:
+                self.detect("high_anchored_replenishment", observed, facts)
+            if c.depletion[side] >= 8 and c.recovered_at is None:
+                self.detect("no_half_recovery_by_cutoff", observed, facts)
+            if abs(facts["impact_ticks"]) <= 1:
+                self.detect("high_flow_weak_mid_response", observed, facts)
+
 
     def trade(self, event: Trade):
         if not self.advance(event.observed):
             return
         stamp = event.observed.monotonic_ns
+        self.last_trade_seen = stamp
+        self.cvd += event.signed_size
         self.append("events", (stamp, "trade"))
         self.append("flow", (stamp, event.signed_size, event.size, event.price_ticks))
         signed = sum(row[1] for row in self.flow if row[0] >= stamp - SECOND)
@@ -203,13 +236,19 @@ class Microstructure:
             "id": sha256(f"{self.capture_id}:{self.instrument.symbol}:{stamp}:{event.exchange_time_ms}".encode()).hexdigest()[:24], "instrument": self.instrument.symbol, "exchange": self.instrument.exchange,
             "expiry": self.instrument.expiry, "source": self.source, "capture_session": self.capture_id,
             "category": "aggressive_flow_burst", "epistemic_status": "MEASUREMENT",
+            "alternative_status": "HYPOTHESIS", "scientific_status": "UNRESOLVED",
             "status": "PENDING", "start": event.observed.wire(), "trade_exchange_ms": event.exchange_time_ms,
             "start_price_ticks": event.price_ticks,
             "clock": "collector_monotonic", "signed_contracts_1s": signed,
             "pre_mid_ticks": mid[1] if mid else None, "pre_depth": top,
+            "feature_schema_version": 2,
+            "anchor_depth_generation": self.depth.gen if anchors else None,
+            "anchor_depth_sequence": self.depth.seq if anchors else None,
             "pre_spread_ticks": self.bbo[2] - self.bbo[1] if mid else None,
             "direction": "BUY" if signed > 0 else "SELL",
             "baseline_utc_ns": event.observed.wire()["utc_ns"],
+            "utc_hour": (event.observed.utc_ns // (3600 * SECOND)) % 24,
+            "market_session": "UNKNOWN",
             "missing_evidence": [], "alternatives": [
                 "displayed replenishment", "cross-stream timing uncertainty", "trade-side classification",
             ], "limitations": "Anonymous observed flow; no actor or causal attribution.",
@@ -230,7 +269,14 @@ class Microstructure:
             return
         stamp = event.observed.monotonic_ns
         bid, ask = event.quote.bid_ticks, event.quote.ask_ticks
+        previous = self.mid
         self.mid = stamp, (bid + ask) / 2
+        if previous and stamp - previous[0] <= self.freshness_ns and abs(self.mid[1] - previous[1]) >= 3:
+            signed = sum(row[1] for row in self.flow if row[0] >= stamp - SECOND)
+            if abs(signed) <= 3:
+                self.detect("price_move_with_weak_net_flow", event.observed,
+                            {"prior_mid_ticks": previous[1], "mid_change_ticks": self.mid[1] - previous[1],
+                             "net_contracts_1s": signed})
         self.bbo = stamp, bid, ask
         c = self.active
         if c and not c.terminal:
@@ -264,6 +310,10 @@ class Microstructure:
         if not self.advance(event.observed):
             self.depth.invalidate("late_receive_clock", event.observed)
             return
+        before_eligible = self.depth_eligible(event.observed.monotonic_ns)
+        if not before_eligible:
+            self.depth_coverage_since = None
+            self.ofi.clear()
         prior_epoch = self.depth.epoch
         movements = self.depth.apply(event, snapshot=snapshot)
         stamp = event.observed.monotonic_ns
@@ -279,9 +329,13 @@ class Microstructure:
             self.append("events", (stamp, "mbp_" + event.kind.lower()))
         if event.kind == "Image" and not movements and (event.src == 1 or snapshot):
             self.append("events", (stamp, "recovery"))
-        for before, after, (side, price, size, _count), old_size in movements if eligible else []:
+        for before, after, (side, price, size, _count), old_size in movements if eligible and before_eligible else []:
             ranks, boundaries = depth_moves(before, after)
             self.append("ofi", (stamp, ranks, boundaries, side, size - old_size))
+            if old_size >= 8 and size <= old_size / 2:
+                self.detect("displayed_depth_contraction", event.observed,
+                            {"side": side, "price_ticks": price, "before_contracts": old_size,
+                             "size_change_contracts": size - old_size})
             c = self.active
             key = side, price
             if c and not c.terminal and key in c.anchors and stamp <= c.start + WINDOW:
@@ -302,6 +356,24 @@ class Microstructure:
         if category:
             self.append("events", (event.observed.monotonic_ns, category))
 
+    def detect(self, category, observed, metrics):
+        stamp = observed.monotonic_ns
+        if category in self.last_detection and stamp - self.last_detection[category] < WINDOW:
+            return
+        self.last_detection[category] = stamp
+        card = {
+            "id": sha256(f"{self.capture_id}:{self.instrument.symbol}:{stamp}:{category}".encode()).hexdigest()[:24],
+            "category": category, "start": observed.wire(), "end": observed.wire(),
+            "source": self.source, "instrument": self.instrument.symbol, "exchange": self.instrument.exchange,
+            "expiry": self.instrument.expiry, "capture_session": self.capture_id,
+            "clock": "collector_monotonic", "epistemic_status": "MEASUREMENT",
+            "status": "OBSERVED", "metrics": metrics,
+            "alternatives": ["execution or displayed-size change", "cross-stream timing or migration"],
+            "missing_evidence": ["participant identity and cause"],
+        }
+        self.cards.append(card)
+        self.durable_cards.append({**card, "phase": "observation"})
+
     def snapshot(self, now):
         stamp = now.monotonic_ns
         active = self.transport and self.flow_coverage_since is not None
@@ -309,7 +381,8 @@ class Microstructure:
         flow = [row for row in self.flow if row[0] >= stamp - WINDOW]
         buy = sum(max(0, signed) for _, signed, _, _ in flow)
         sell = sum(max(0, -signed) for _, signed, _, _ in flow)
-        flow_full = active and stamp - self.flow_coverage_since >= WINDOW and stamp >= self.saturated_until.get("flow", 0)
+        fresh_trade = self.last_trade_seen is not None and stamp - self.last_trade_seen <= self.freshness_ns
+        flow_full = active and fresh_trade and stamp - self.flow_coverage_since >= WINDOW and stamp >= self.saturated_until.get("flow", 0)
         ofi = [row for row in self.ofi if row[0] >= stamp - WINDOW] if valid_depth else []
         ofi_full = valid_depth and self.depth_coverage_since is not None and (
             stamp - self.depth_coverage_since >= WINDOW and stamp >= self.saturated_until.get("ofi", 0)
@@ -320,14 +393,21 @@ class Microstructure:
         comparable = bool(valid_depth and self.bbo and (
             abs(self.depth.available.monotonic_ns - self.bbo[0]) <= 250_000_000
         ) and stamp - self.bbo[0] <= self.freshness_ns)
+        samples = [available for seen, available in self.samples if seen >= stamp - WINDOW]
         order_fresh = self.orders and self.orders.last and (
             stamp - self.orders.last.monotonic_ns <= self.freshness_ns
         )
         counts = Counter(category for seen, category in self.events if seen >= stamp - WINDOW)
+        latencies = sorted(self.processing_ns)
         return {
+            "diagnostics": {
+                "stream_frames_processed": self.processed,
+                "processing_p95_us": latencies[int((len(latencies) - 1) * .95)] / 1000 if latencies else None,
+                "measurement_overflow": {name: stamp < until for name, until in self.saturated_until.items()},
+            },
             "mode": self.mode, "clock": "collector_monotonic", "window_seconds": 2,
             "trade_flow": {"status": "VALID" if flow_full else "PARTIAL" if active else "UNAVAILABLE",
-                           "buy": buy, "sell": sell, "net": buy - sell, "count": len(flow),
+                           "buy": buy, "sell": sell, "net": buy - sell, "count": len(flow), "cvd_observed": self.cvd,
                            "unknown": sum(size for _, signed, size, _ in flow if not signed),
                            "trades_per_second": len(flow) / 2 if flow_full else None,
                            "price_response_ticks_per_signed_contract": (
@@ -346,6 +426,8 @@ class Microstructure:
                     "count": len(ofi) if ofi_full else None},
             "liquidity": {"status": "VALID" if valid_depth else "UNAVAILABLE", "top": top,
                           "top_n_depth": totals if valid_depth else None,
+                          "sampled_unavailable_fraction": samples.count(False) / len(samples) if samples else None,
+                          "recovery_count": self.depth.counts["recoveries"] if self.depth else None,
                           "spread_ticks": top[1][0][0] - top[0][0][0] if valid_depth else None,
                           "distance_ticks": [[abs(p - side[0][0]) for p, _, _ in side] for side in top],
                           "imbalance": (totals[0] - totals[1]) / total if total else None,
@@ -354,12 +436,16 @@ class Microstructure:
                               (top[0][0][0], top[1][0][0]) != self.bbo[1:] if comparable else None
                           )},
             "mbo": {
-                "status": self.orders.status if order_fresh else "STALE_OR_AWAITING" if self.orders else "DISABLED",
+                "status": (
+                    self.orders.status if self.orders and (order_fresh or self.orders.status != "OBSERVED_PARTIAL_BOOK")
+                    else "STALE" if self.orders else "DISABLED"
+                ),
                 "entitlement": self.entitlement,
                 "epoch": self.orders.epoch if self.orders else None,
                 "order_count": len(self.orders.orders) if order_fresh and self.orders.status == "OBSERVED_PARTIAL_BOOK" else None,
                 "counts": dict(self.orders.counts) if self.orders else None,
                 "observed_resting_ms": list(self.orders.durations_ms)[-12:] if order_fresh else None,
+                "cohort_survival": self.orders.survival(stamp) if order_fresh else None,
                 "added_size_sample": list(self.orders.added_sizes)[-12:] if order_fresh else None,
             },
             "intensity": {"status": "VALID" if flow_full and stamp >= self.saturated_until.get("events", 0) else "PARTIAL",

@@ -194,3 +194,187 @@ def test_mode_c_live_without_entitlement_degrades_to_b():
         status = client.get("/api/status").json()
         assert status["market_data_mode"] == "B"
         assert status["mbo_entitlement"] == "UNVERIFIED"
+
+
+def test_bounded_recovery_buffer_requires_snapshot_after_highest_discarded_sequence(monkeypatch):
+    monkeypatch.setattr("observatory.books.RECOVERY_BUFFER", 2)
+    book = DepthBook()
+    init(book)
+    for seq in range(4, 8):
+        depth(book, "Update", seq)
+    assert len(book.pending) <= 2
+    assert book.counts["buffer_high_water"] == 2
+    assert book.counts["buffer_overflow"] == 1
+    depth(book, "Image", 6, t=8, src=1, snapshot=True)
+    assert not book.valid
+    depth(book, "Image", 7, t=9, src=1, snapshot=True)
+    assert book.valid
+
+
+def test_replay_uses_durable_order_and_preserves_gap_after_recovery(tmp_path):
+    from observatory.replay import replay
+
+    database = tmp_path / "replay.sqlite"
+    with TestClient(create_app(mode="C", interval=0.01, capture_path=database)) as client:
+        with client.websocket_connect("/ws") as ws:
+            for _ in range(16):
+                data = ws.receive_json()
+                if data["microstructure"]["mbp"]["counts"].get("recoveries"):
+                    break
+            else:
+                pytest.fail("No durable depth recovery")
+        session = data["status"]["recorder"]["session_id"]
+        first = replay(database, session, "C", 200)
+        # Read the exact same immutable prefix even while the recorder progresses.
+        second = replay(database, session, "C", first["records_processed"])
+        assert first["snapshot"] == second["snapshot"]
+        assert first["snapshot"]["mbp"]["gaps"][0]["reason"] == "sequence"
+        assert first["snapshot"]["mbo"]["counts"]["exact_fill"] > 0
+
+
+def test_recovery_times_out_with_bounded_requests_while_socket_stays_open():
+    import asyncio
+    from websockets.asyncio.server import serve
+    from observatory.collector import Collector
+    from observatory.state import ObservatoryState
+
+    async def scenario():
+        requests = []
+
+        async def vendor(socket):
+            subscribe = json.loads(await socket.recv())
+            requests.append(subscribe)
+            await socket.send(json.dumps({"id": subscribe["id"], "result": None}))
+            await socket.send(json.dumps({"stream": "comex.gcz6@depthraw", "data": {"type": "Reset", "gen": 1}}))
+            async for request in socket:
+                requests.append(json.loads(request))
+
+        state = ObservatoryState(MOCK_GC)
+        micro = Microstructure("B", MOCK_GC, "fxaurum_mock")
+        async with serve(vendor, "127.0.0.1", 0) as server:
+            port = server.sockets[0].getsockname()[1]
+            collector = Collector(f"ws://127.0.0.1:{port}/", state, micro=micro, ack_timeout=0.1)
+            task = asyncio.create_task(collector.run())
+            try:
+                async with asyncio.timeout(3):
+                    while micro.depth.state != "RECOVERY_FAILED":
+                        await asyncio.sleep(0.01)
+                assert [req["method"] for req in requests] == ["SUBSCRIBE", *["depthSnap"] * 3]
+                assert len({req["id"] for req in requests}) == 4
+                assert state.connected
+                assert state.last_ack_request_id == requests[0]["id"]
+                assert micro.depth.gaps[0]["reason"] == "snapshot_timeout"
+            finally:
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+    asyncio.run(scenario())
+
+
+def test_probe_correlates_response_and_uses_only_operator_rpc():
+    import asyncio
+    from websockets.asyncio.server import serve
+    from observatory.__main__ import probe
+
+    async def scenario():
+        async def vendor(socket):
+            request = json.loads(await socket.recv())
+            assert request == {"method": "mboProbe", "id": 1,
+                               "params": {"exchange": "COMEX", "symbol": "GCZ6", "ms": 8000}}
+            await socket.send(json.dumps({"id": 2, "result": {"entitled": True}}))
+            await socket.send(json.dumps({"id": 1, "result": {"entitled": False}}))
+
+        async with serve(vendor, "127.0.0.1", 0) as server:
+            assert not await probe(MOCK_GC, server.sockets[0].getsockname()[1])
+    asyncio.run(scenario())
+
+
+def test_stream_rejection_degrades_from_c_to_b_and_preserves_trade_bbo():
+    import asyncio
+    from websockets.asyncio.server import serve
+    from observatory.collector import Collector
+    from observatory.state import ObservatoryState
+
+    async def scenario():
+        requests = []
+
+        async def vendor(socket):
+            request = json.loads(await socket.recv())
+            requests.append(request)
+            if len(request["params"]) == 4:
+                await socket.send(json.dumps({"id": request["id"], "status": 403, "error": "DBO unavailable"}))
+                await socket.wait_closed()
+                return
+            await socket.send(json.dumps({"id": request["id"], "result": None}))
+            await socket.send(json.dumps({
+                "stream": "comex.gcz6@trade",
+                "data": {"s": "GCZ6", "e": "trade", "T": 1_800_000_000_000, "tc": 0,
+                         "p": 2750.1, "q": 1, "side": ""},
+            }))
+            await socket.wait_closed()
+
+        state = ObservatoryState(MOCK_GC)
+        micro = Microstructure("C", MOCK_GC, "fxaurum_mock")
+        async with serve(vendor, "127.0.0.1", 0) as server:
+            port = server.sockets[0].getsockname()[1]
+            collector = Collector(f"ws://127.0.0.1:{port}/", state, micro=micro, retry_delay=0.01)
+            task = asyncio.create_task(collector.run())
+            try:
+                async with asyncio.timeout(3):
+                    while state.last_trade is None:
+                        await asyncio.sleep(0.01)
+                assert micro.mode == "B" and micro.orders is None
+                assert micro.entitlement == "SUBSCRIPTION_REJECTED"
+                assert [len(request["params"]) for request in requests] == [4, 3]
+                assert state.last_trade.signed_size == 0 and state.cvd == 0
+            finally:
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+
+    asyncio.run(scenario())
+
+
+def test_bounded_measurement_saturation_and_mixed_receive_clock(monkeypatch):
+    monkeypatch.setattr("observatory.microstructure.LIMIT", 2)
+    engine = setup_candidate()
+    for seq, t in [(1, 1.1), (2, 1.2), (3, 1.3)]:
+        depth(engine, "Update", seq, t=t)
+    view = engine.snapshot(stamp(2.5))
+    assert len(engine.ofi) == 2
+    assert view["diagnostics"]["measurement_overflow"]["ofi"]
+    assert view["ofi"]["ranks"] is None
+    depth(engine, "Update", 4, t=1.2)
+    assert engine.depth.state == "GAP_DETECTED"
+    assert engine.depth.gaps[-1]["reason"] == "late_receive_clock"
+
+
+def test_same_sequence_gateway_repair_can_change_state_but_never_invents_flow():
+    engine = setup_candidate()
+    depth(engine, "Update", 1, t=1.1, q=8)
+    depth(engine, "Image", 1, t=1.2, src=1)
+    assert engine.depth.levels["S"][27501] == (10, 2)
+    assert engine.depth.gaps[-1]["reason"] == "gateway_image"
+    assert engine.active.card["status"] == "INELIGIBLE"
+    assert not engine.ofi
+    depth(engine, "Image", 1, t=1.3, src=1)
+    assert engine.depth.counts["duplicate_image"] == 1
+    assert len(engine.depth.gaps) == 1
+
+
+def test_receive_time_liquidity_and_intensity_golden_values():
+    engine = Microstructure("B", MOCK_GC, "fxaurum_mock")
+    engine.connect(stamp())
+    init(engine)
+    depth(engine, "Update", 1, t=1, q=5)
+    event(engine, "bookTicker", 1.2, b=Decimal("2749.9"), a=Decimal("2750.1"), B=10, A=5)
+    event(engine, "trade", 1.3, e="trade", T=1_800_000_000_000, p=2750, q=3, side="", tc=0)
+    view = engine.snapshot(stamp(2))
+    assert view["liquidity"]["top_n_depth"] == [10, 5]
+    assert view["liquidity"]["spread_ticks"] == 2
+    assert view["liquidity"]["imbalance"] == pytest.approx(1 / 3)
+    assert view["liquidity"]["concentration"] == pytest.approx(5 / 9)
+    assert view["liquidity"]["bbo_disagreement"] is False
+    assert view["ofi"]["best_level"] == 5
+    assert view["ofi"]["price_fixed_ask_change"] == -5
+    assert view["intensity"]["rates_per_second"] == {"mbp_update": 0.5, "trade": 0.5}
+    assert view["trade_flow"]["net"] == 0 and view["trade_flow"]["unknown"] == 3
+    assert engine.snapshot(stamp(4.2))["liquidity"]["status"] == "UNAVAILABLE"

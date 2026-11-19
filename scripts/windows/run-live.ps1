@@ -3,6 +3,8 @@ param(
     [Parameter(Mandatory=$true)][string]$Expiry,
     [int]$GatewayPort = 9001,
     [int]$Port = 8000,
+    [ValidateSet("A", "B", "C")][string]$Mode = "A",
+    [switch]$MboEntitled,
     [switch]$Capture,
     [int]$RetentionDays = 7
 )
@@ -14,7 +16,8 @@ New-Item -ItemType Directory -Force $runtime | Out-Null
 $stop = Join-Path $runtime "stop-$Port"
 if (Test-Path -LiteralPath $stop) { Remove-Item -LiteralPath $stop }
 $cli = @('-m', 'observatory', 'live', '--symbol', $Symbol, '--expiry', $Expiry,
-    '--gateway-port', $GatewayPort, '--port', $Port, '--stop-file', $stop)
+    '--mode', $Mode, '--gateway-port', $GatewayPort, '--port', $Port, '--stop-file', $stop)
+if ($MboEntitled) { $cli += "--mbo-entitled" }
 if ($Capture) {
     $cli += @('--capture', (Join-Path $runtime 'live.sqlite'), '--retention-days', $RetentionDays)
 }

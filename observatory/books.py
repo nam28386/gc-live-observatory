@@ -95,6 +95,9 @@ def parse_order(data: dict, observed: Observation) -> OrderEvent:
     kind = data.get("type")
     if kind not in ("Reset", "Image", "New", "Change", "Delete", "Fill"):
         raise ParseError("Unknown MBO event")
+    if kind == "Reset":
+        return OrderEvent(kind, observed, None, None, None, None, None, None, None, None,
+                          optional_int(data, "ts"), optional_int(data, "tu"), optional_int(data, "gw"))
     oid = data.get("oid")
     if kind != "Reset" and (not isinstance(oid, str) or not oid or len(oid) > 128):
         raise ParseError("Invalid MBO order ID")
@@ -130,6 +133,7 @@ class DepthBook:
         self.last = None
         self.recovery_ns = None
         self.available = None
+        self.lost_through = -1
 
     @property
     def valid(self):
@@ -148,6 +152,7 @@ class DepthBook:
             self.invalidate("transport", observed)
         self.gen = self.seq = None
         self.pending.clear()
+        self.lost_through = -1
         self.levels = {"B": {}, "S": {}}
         self.last = self.available = None
         self.state = "UNINITIALIZED"
@@ -168,6 +173,7 @@ class DepthBook:
             self.gen, self.seq = event.gen, event.seq
             self.levels = {"B": {}, "S": {}}
             self.pending.clear()
+            self.lost_through = -1
             self.last = event
             self.state = "SNAPSHOT_PENDING"
             return []
@@ -178,8 +184,15 @@ class DepthBook:
             return []
         if event.kind == "Image":
             floor = self.seq if self.seq is not None else -1
-            if event.seq < floor or (self.valid and event.seq == floor):
+            if event.seq < max(floor, self.lost_through):
                 self.counts["stale_image"] += 1
+                return []
+            image_levels = {"B": {}, "S": {}}
+            for side, price, quantity, count in event.rows:
+                if quantity:
+                    image_levels[side][price] = (quantity, count)
+            if self.valid and event.seq == floor and image_levels == self.levels:
+                self.counts["duplicate_image"] += 1
                 return []
             if self.valid:
                 if event.src != 1 and not snapshot:
@@ -191,13 +204,11 @@ class DepthBook:
                 self.counts["incomplete_image"] += 1
                 self.state = "GAP_DETECTED"
                 return []
-            self.levels = {"B": {}, "S": {}}
-            for side, price, quantity, count in event.rows:
-                if quantity:
-                    self.levels[side][price] = (quantity, count)
+            self.levels = image_levels
             self.seq, self.last = event.seq, event
             self.state = "VALID_BOOK"
             self.pending.clear()
+            self.lost_through = -1
             for seq, delta in buffered:
                 if seq > self.seq:
                     self.apply(delta)
@@ -214,23 +225,30 @@ class DepthBook:
         if self.seq is not None and event.seq <= self.seq:
             self.counts["duplicate_or_late"] += 1
             return []
-        if self.state in ("OVERFLOW", "RECOVERY_FAILED"):
+        if self.state == "OVERFLOW" or self.lost_through >= 0:
+            self.lost_through = max(self.lost_through, event.seq)
+            self.counts["discarded_while_invalid"] += 1
+            return []
+        if self.state == "RECOVERY_FAILED":
             self.counts["discarded_while_invalid"] += 1
             return []
         if not self.valid or self.seq is None or event.seq != self.seq + 1:
             self.invalidate("sequence" if self.seq is not None else "missing_image", event.observed)
             if event.seq not in self.pending and len(self.pending) >= RECOVERY_BUFFER:
                 self.counts["buffer_overflow"] += 1
+                self.lost_through = max(event.seq, *self.pending)
                 self.pending.clear()
                 self.state = "OVERFLOW"
             elif self.state != "OVERFLOW":
                 self.pending.setdefault(event.seq, event)
+                self.counts["buffer_high_water"] = max(self.counts["buffer_high_water"], len(self.pending))
             return []
         before = self.top()
         side, price, quantity, count = event.level
         old_size = self.levels[side].get(price, (0, 0))[0]
         if quantity and not old_size and sum(map(len, self.levels.values())) >= DEPTH_LIMIT:
             self.invalidate("book_bound", event.observed)
+            self.lost_through = event.seq
             self.state = "OVERFLOW"
             return []
         if quantity:
@@ -273,11 +291,13 @@ class OrderBook:
         self.last = None
         self.durations_ms = deque(maxlen=256)
         self.added_sizes = deque(maxlen=512)
+        self.cohort = {}
 
     def disconnect(self):
         self.orders.clear()
         self.retired.clear()
         self.fills.clear()
+        self.cohort.clear()
         self.status = "AWAITING_RESET"
         self.last = None
 
@@ -297,16 +317,22 @@ class OrderBook:
             if existing and (existing.side, existing.price) != (event.side, event.price):
                 self.counts["fill_other_leg_unattributed"] += 1
                 return None
-            prior = self.fills.get(key, 0)
+            prior, prior_inferred = self.fills.get(key, (0, 0))
             if existing:
-                prior = max(prior, existing.cumulative)
+                if existing.cumulative >= prior:
+                    prior, prior_inferred = existing.cumulative, existing.inferred
             if event.cumulative <= prior:
                 self.counts["duplicate_or_late_fill"] += 1
                 return None
+            if event.inferred < prior_inferred:
+                self.counts["inconsistent_cumulative_fill"] += 1
+                return None
+            if event.cumulative - prior != event.quantity:
+                self.counts["fill_cumulative_discontinuity"] += 1
             if key not in self.fills and len(self.fills) >= ORDER_LIMIT:
                 self.status = "OVERFLOW"
                 return None
-            self.fills[key] = event.cumulative
+            self.fills[key] = event.cumulative, event.inferred
             if existing:
                 existing.cumulative = event.cumulative
                 existing.inferred = event.inferred
@@ -324,6 +350,8 @@ class OrderBook:
                 self.counts["unknown_delete"] += 1
                 return None
             del self.orders[oid]
+            if oid in self.cohort and self.cohort[oid][1] is None:
+                self.cohort[oid] = self.cohort[oid][0], event.observed.monotonic_ns
             if not existing.left_censored:
                 self.durations_ms.append((event.observed.monotonic_ns - existing.first.monotonic_ns) / 1e6)
             category = "order_removal_unattributed"
@@ -347,12 +375,17 @@ class OrderBook:
                     return None
                 order = RestingOrder(oid, side, price, size, event.priority, event.observed, event.observed,
                                      kind == "Image", self.epoch)
+                order.cumulative, order.inferred = self.fills.get((oid, side, price), (0, 0))
                 self.orders[oid] = order
                 self.retired.discard(oid)
                 if kind == "Image":
                     self.counts["left_censored"] += 1
                 else:
                     self.added_sizes.append(size)
+                    if len(self.cohort) < 512 and oid not in self.cohort:
+                        self.cohort[oid] = event.observed.monotonic_ns, None
+                    if event.priority is not None:
+                        self.counts["additions_with_priority"] += 1
             else:
                 order = existing
                 if (side, price) != (order.side, order.price):
@@ -370,3 +403,28 @@ class OrderBook:
         self.last = event.observed
         self.counts[category] += 1
         return category
+
+    def survival(self, observed_ns):
+        if not self.cohort or self.status != "OBSERVED_PARTIAL_BOOK":
+            return None
+        durations = Counter()
+        removals = Counter()
+        for started, ended in self.cohort.values():
+            age = (ended if ended is not None else observed_ns) - started
+            durations[age] += 1
+            if ended is not None:
+                removals[age] += 1
+        points = {}
+        at_risk, survival = len(self.cohort), 1.0
+        times = iter(sorted(durations))
+        age = next(times, None)
+        for horizon_ms in (100, 1000, 5000):
+            horizon = horizon_ms * 1_000_000
+            while age is not None and age <= horizon:
+                survival *= 1 - removals[age] / at_risk
+                at_risk -= durations[age]
+                age = next(times, None)
+            points[str(horizon_ms)] = survival if horizon <= max(durations) else None
+        return {"population": "first 512 New observations in this epoch", "sample_size": len(self.cohort),
+                "right_censored": sum(end is None for _, end in self.cohort.values()),
+                "survival_at_ms": points}

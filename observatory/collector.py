@@ -4,6 +4,7 @@ import asyncio
 from dataclasses import replace
 from decimal import Decimal, DecimalException
 import json
+from time import perf_counter_ns
 from urllib.parse import urlsplit
 
 from websockets.asyncio.client import ClientConnection, connect
@@ -156,7 +157,7 @@ class Collector:
                     if self.micro:
                         self.micro.connect(pending[0][1] if pending else observed)
                     for message in pending:
-                        await self.apply(*message)
+                        await self.process(*message)
                     return
         except TimeoutError:
             raise SubscriptionFailure("subscribe_ack_timeout") from None
@@ -175,10 +176,21 @@ class Collector:
         pending = None
         recovery_key = None
         attempts = 0
+        reset_deadline = None
         loop = asyncio.get_running_loop()
         while True:
             depth = self.micro.depth if self.micro else None
             if depth:
+                if depth.state == "SNAPSHOT_PENDING" and reset_deadline is None:
+                    reset_deadline = loop.time() + self.ack_timeout
+                if depth.state != "SNAPSHOT_PENDING":
+                    reset_deadline = None
+                elif loop.time() >= reset_deadline:
+                    observed = Observation.now()
+                    depth.invalidate("snapshot_timeout", observed)
+                    if self.journal:
+                        await self.journal.append("mbp_gap", observed.utc_ns, depth.gaps[-1])
+                    reset_deadline = None
                 key = depth.gen, depth.epoch
                 if key != recovery_key:
                     pending, attempts, recovery_key = None, 0, key
@@ -201,8 +213,9 @@ class Collector:
                         depth.state = "RECOVERY_FAILED"
                         depth.counts["retry_exhausted"] += 1
             try:
-                if pending:
-                    frame = await asyncio.wait_for(socket.recv(), max(0, pending[1] - loop.time()))
+                deadline = pending[1] if pending else reset_deadline
+                if deadline is not None:
+                    frame = await asyncio.wait_for(socket.recv(), max(0, deadline - loop.time()))
                 else:
                     frame = await socket.recv()
             except TimeoutError:
@@ -216,7 +229,7 @@ class Collector:
                 continue
             payload, observed, raw = decoded
             if "stream" in payload:
-                await self.apply(*decoded)
+                await self.process(*decoded)
             elif pending and type(payload.get("id")) is int and payload["id"] == pending[0]:
                 pending = None
                 try:
@@ -235,6 +248,8 @@ class Collector:
         depth = self.micro.depth
         gaps_before = depth.counts["gaps"] if depth else 0
         recoveries_before = depth.counts["recoveries"] if depth else 0
+        overflows_before = depth.counts["buffer_overflow"] if depth else 0
+        order_status_before = self.micro.orders.status if self.micro.orders else None
         if self.journal:
             await self.journal.append(kind, event.observed.utc_ns, {
                 "event_schema_version": 2, "event": event.wire(), "raw": raw,
@@ -247,8 +262,19 @@ class Collector:
         if self.journal and depth:
             if depth.counts["gaps"] != gaps_before:
                 await self.journal.append("mbp_gap", event.observed.utc_ns, depth.gaps[-1])
+            if depth.counts["buffer_overflow"] != overflows_before:
+                await self.journal.append("mbp_overflow", event.observed.utc_ns, {
+                    "reason": "recovery_buffer_overflow", "lost_through_seq": depth.lost_through,
+                    "observed": event.observed.wire(), "generation": depth.gen,
+                })
             if depth.counts["recoveries"] != recoveries_before:
                 await self.journal.append("mbp_recovery", event.observed.utc_ns, depth.gaps[-1])
+        if self.journal and self.micro.orders and self.micro.orders.status in ("INVALID", "OVERFLOW") and (
+            self.micro.orders.status != order_status_before
+        ):
+            await self.journal.append("mbo_continuity", event.observed.utc_ns, {
+                "reason": self.micro.orders.status, "observed": event.observed.wire(),
+            })
         await self.persist_cards(event.observed)
 
     async def persist_cards(self, observed):
@@ -270,6 +296,13 @@ class Collector:
             return None
         return payload, observed, frame
 
+    async def process(self, payload, observed, frame):
+        started = perf_counter_ns()
+        await self.apply(payload, observed, frame)
+        if self.micro:
+            self.micro.processed += 1
+            self.micro.processing_ns.append(perf_counter_ns() - started)
+
     async def apply(self, payload: dict, observed: Observation, frame: str) -> None:
         try:
             stream = payload.get("stream")
@@ -290,6 +323,8 @@ class Collector:
             if self.micro and channel == "depthraw" and self.micro.depth:
                 if stream.lower() == self.streams[2].lower():
                     self.micro.depth.invalidate("malformed_mbp", observed)
+                    if self.journal:
+                        await self.journal.append("mbp_gap", observed.utc_ns, self.micro.depth.gaps[-1])
                     self.micro.advance(observed)
                     await self.persist_cards(observed)
             if self.micro and channel == "mboraw" and self.micro.orders:

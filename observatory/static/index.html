@@ -34,6 +34,23 @@
       <article class="chart" data-frame="H1"><header><h2>H1</h2><output>Awaiting trade</output></header><canvas aria-label="H1 candle chart"></canvas></article>
     </section>
 
+    <section class="microstructure" aria-label="Microstructure measurements">
+      <div class="micro-heading"><h2>Microstructure</h2><output id="depth-health"></output></div>
+      <div class="analytic-grid">
+        <article><h3>Aggressive trade flow</h3><output id="micro-flow"></output></article>
+        <article><h3>Order flow imbalance</h3><output id="micro-ofi"></output></article>
+        <article><h3>Liquidity quality</h3><output id="micro-liquidity"></output></article>
+        <article><h3>Impact and replenishment</h3><output id="micro-refill"></output></article>
+        <article><h3>MBO lifecycle</h3><output id="micro-mbo"></output></article>
+        <article><h3>Event intensity</h3><output id="micro-intensity"></output></article>
+      </div>
+      <details class="evidence"><summary>Evidence cards <output id="evidence-count"></output></summary>
+        <label for="evidence-select">Observation</label>
+        <select id="evidence-select"><option value="">No candidates</option></select>
+        <pre id="evidence-card"></pre>
+      </details>
+    </section>
+
     <section class="diagnostics" aria-label="Capture diagnostics">
       <div><span>Collector socket</span><output id="transport">—</output></div>
       <div><span>Subscribe ACK</span><output id="ack">—</output></div>

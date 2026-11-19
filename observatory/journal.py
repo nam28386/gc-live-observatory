@@ -41,10 +41,13 @@ class Journal:
                 import fcntl
                 fcntl.flock(lease, fcntl.LOCK_EX | fcntl.LOCK_NB)
             await self.io(self.start, time.time_ns())
-            try:
-                yield self
-            finally:
-                await self.io(self.finish, time.time_ns())
+            # Retain one idle WAL connection so each event commit doesn't
+            # checkpoint solely because its short-lived writer is the last handle.
+            with closing(self.db()):
+                try:
+                    yield self
+                finally:
+                    await self.io(self.finish, time.time_ns())
 
     def db(self):
         connection = sqlite3.connect(self.path, timeout=2)
@@ -85,8 +88,13 @@ class Journal:
             """)
             with db:
                 previous = db.execute(
-                    "SELECT * FROM sessions WHERE provenance = ? ORDER BY rowid DESC LIMIT 1",
-                    (json.dumps(self.provenance, sort_keys=True),),
+                    """SELECT * FROM sessions
+                       WHERE json_extract(provenance, '$.source') IS ?
+                         AND json_extract(provenance, '$.exchange') IS ?
+                         AND json_extract(provenance, '$.symbol') IS ?
+                         AND json_extract(provenance, '$.expiry') IS ?
+                       ORDER BY rowid DESC LIMIT 1""",
+                    tuple(self.provenance.get(key) for key in ("source", "exchange", "symbol", "expiry")),
                 ).fetchone()
                 db.execute("UPDATE sessions SET ended = durable, termination = 'unclean' WHERE ended IS NULL")
                 db.execute(
@@ -143,14 +151,21 @@ class Journal:
             db.execute("UPDATE sessions SET ended = ?, termination = ? WHERE id = ?",
                        (now, "recorder_error" if self.failures else "clean", self.session))
 
-    def history(self, after=0, limit=100, *, gaps=False):
+    def history(self, after=0, limit=100, *, gaps=False, session_id=None, read_only=False):
         sql = """SELECT r.*, s.provenance FROM records r JOIN sessions s ON r.session_id = s.id
                  WHERE r.id > ?"""
         if gaps:
-            sql += " AND r.kind IN ('gap', 'restart_gap', 'coverage_start', 'mbp_gap', 'mbp_recovery')"
+            sql += " AND r.kind IN ('gap', 'restart_gap', 'coverage_start', 'mbp_gap', 'mbp_recovery', 'mbp_overflow', 'mbo_continuity')"
+        arguments = [after]
+        if session_id is not None:
+            sql += " AND r.session_id = ?"
+            arguments.append(session_id)
         sql += " ORDER BY r.id DESC LIMIT ?" if gaps else " ORDER BY r.id LIMIT ?"
-        with closing(self.db()) as db:
-            records = db.execute(sql, (after, limit)).fetchall()
+        arguments.append(limit)
+        connection = sqlite3.connect(self.path.resolve().as_uri() + "?mode=ro", uri=True) if read_only else self.db()
+        with closing(connection) as db:
+            db.row_factory = sqlite3.Row
+            records = db.execute(sql, arguments).fetchall()
         return [{
             "schema_version": SCHEMA, "id": row["id"], "session_id": row["session_id"],
             "utc_ns": str(row["utc_ns"]), "kind": row["kind"], "payload": json.loads(row["payload"]),

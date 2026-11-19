@@ -35,6 +35,7 @@ def create_app(
     journal = Journal(capture_path, {
         "source": state.source, "exchange": instrument.exchange,
         "symbol": instrument.symbol, "expiry": instrument.expiry,
+        "measurement_schema_version": 2, "stale_after_ns": state.stale_after_ns,
         "protocol_revision": "581cb6b3706c93ccd1667b32234e904654a44728",
     }, retention_days) if capture_path is not None else None
 
@@ -44,6 +45,7 @@ def create_app(
     elif requested_mode == "C":
         micro.entitlement = "UNVERIFIED"
     micro.capture_id = journal.session if journal else None
+    started = Observation.now().monotonic_ns
 
     @asynccontextmanager
     async def lifespan(_: FastAPI):
@@ -78,6 +80,9 @@ def create_app(
             "session_id": journal.session if journal else None,
             "durable_events": journal.written if journal else 0,
             "failures": journal.failures if journal else 0,
+            "average_records_per_second": (
+                journal.written * 1e9 / max(1, now.monotonic_ns - started) if journal else None
+            ),
         }
         return snapshot
 

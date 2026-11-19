@@ -56,3 +56,16 @@ canvas { width: 100%; height: clamp(150px, 23vh, 260px); display: block; }
 #timeline { padding: 8px 0; }
 #timeline h2 { font-size: .9rem; }
 #timeline li { color: var(--muted); font-size: .8rem; margin-block: .35rem; }
+
+.microstructure { margin-block: 20px; }
+.micro-heading { display: flex; justify-content: space-between; align-items: baseline; gap: 12px; }
+.micro-heading h2 { font-size: 1rem; }
+.micro-heading output, .analytic-grid h3, .evidence label { color: var(--muted); font-size: .8rem; }
+.analytic-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px; margin-block: 10px; }
+.analytic-grid article { padding: 10px 12px; border: 1px solid var(--line); border-radius: 6px; background: var(--surface); }
+.analytic-grid h3 { margin: 0 0 5px; font-weight: 550; }
+.analytic-grid output { font-size: .83rem; line-height: 1.55; }
+.evidence { padding: 10px 0; border-block: 1px solid var(--line); }
+.evidence label, .evidence select { margin: 10px 4px 0 0; }
+.evidence pre { max-height: 17rem; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; }
+@media (max-width: 720px) { .analytic-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); } }

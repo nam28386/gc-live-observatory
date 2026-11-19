@@ -35,3 +35,14 @@ The acceptance details, measurement policy and Windows handoff are in [PR00 cont
 ## Windows LIVE
 
 Use an explicitly selected COMEX GC contract and expiry with the loopback Fxaurum adapter. The [Windows operator guide](docs/WINDOWS_LIVE_VALIDATION.md) covers installation, launch, smoke and graceful stop. The [Phase 01 architecture](docs/PHASE01_ARCHITECTURE.md) describes optional local recording and its HTTP history API.
+
+## Phase 02 microstructure
+
+Run the full synthetic workstation from the repo root.
+
+```bash
+uv run --locked python -m observatory mock --mode C
+uv run --locked python -m scripts.benchmark_phase02 --events 10000 --writes 1000
+```
+
+Use mode A for Trade/BBO, B to add MBP and C to add DBO. The default remains A. Open the dashboard on IPv4 loopback port 8000. A local capture can be inspected independently with `uv run --locked python -m observatory.replay <database> <session-id> --mode C`. Use the recorder's session ID and select the captured mode. See [measurement integrity](docs/MEASUREMENT_INTEGRITY.md) for eligibility and [Windows validation](docs/WINDOWS_LIVE_VALIDATION.md) for the entitlement checks.
