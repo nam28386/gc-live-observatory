@@ -68,6 +68,7 @@ def test_every_canvas_updates_from_mock_websocket_and_gap_is_visible(app_url, mo
         expect(page.locator("#spread")).to_have_text("2 ticks")
         expect(page.get_by_label("Capture operations")).to_be_visible()
         expect(page.locator("#ops-capture")).to_contain_text("backlog")
+        expect(page.locator("#ops-storage")).to_contain_text("AVAILABLE · durable #")
         expect(page.locator("#ops-session")).to_contain_text("UNKNOWN")
         expect(page.locator("#ops-mode")).to_have_text(mode + " → " + mode)
         expect(page.locator("#ops-queue")).to_contain_text("/64")
@@ -80,6 +81,7 @@ def test_every_canvas_updates_from_mock_websocket_and_gap_is_visible(app_url, mo
         if mode == "C":
             expect(page.locator("#depth-health")).to_contain_text("VALID_BOOK")
             expect(page.locator("#micro-mbo")).to_contain_text("SYNTHETIC")
+            expect(page.locator("#ops-depth")).to_contain_text("DBO SYNTHETIC")
             expect(page.locator("#timeline-entries")).to_contain_text("MBP snapshot recovered")
             expect(page.locator("#micro-ofi")).to_contain_text("VALID")
             page.locator("summary").filter(has_text="Evidence cards").click()

@@ -10,7 +10,7 @@ import sqlite3
 
 from .books import parse_depth, parse_order
 from .events import Instrument, Observation, Trade, parse_event
-from .journal import Journal
+from .journal import APPLICATION_ID, SCHEMA, Journal
 from .microstructure import Microstructure
 from .state import ObservatoryState
 
@@ -29,6 +29,9 @@ def capture_prefix(path, session, through_id=None, *, strict=False):
     with closing(sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True)) as db:
         db.row_factory = sqlite3.Row
         db.execute("BEGIN")  # Pin one WAL reader snapshot across pages and retention.
+        if strict and (db.execute("PRAGMA application_id").fetchone()[0] != APPLICATION_ID
+                       or db.execute("PRAGMA user_version").fetchone()[0] != SCHEMA):
+            raise ValueError("Unsupported capture database schema")
         info = db.execute("SELECT provenance FROM sessions WHERE id = ?", (session,)).fetchone()
         if not info:
             raise ValueError("Unknown capture session")

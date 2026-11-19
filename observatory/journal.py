@@ -5,6 +5,7 @@ from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager, closing
 import json
+import errno
 from pathlib import Path
 import sqlite3
 import sys
@@ -20,6 +21,15 @@ class JournalError(RuntimeError):
     pass
 
 
+def storage_issue(error):
+    code = getattr(error, "sqlite_errorcode", 0) & 0xFF
+    if getattr(error, "errno", None) == errno.ENOSPC or code == sqlite3.SQLITE_FULL:
+        return "STORAGE_FULL"
+    if isinstance(error, PermissionError) or code == sqlite3.SQLITE_READONLY:
+        return "STORAGE_PERMISSION_DENIED"
+    return "RECORDER_IO_FAILED"
+
+
 class Journal:
     def __init__(self, path: Path, provenance: dict, retention_days: int = 7, *, batch_size: int = 1):
         self.path = path
@@ -29,6 +39,7 @@ class Journal:
         self.written = 0
         self.market_records = 0
         self.failures = 0
+        self.storage_issue = None
         self.next_prune = 0
         self.batch_size = batch_size
         self.visibility = asyncio.Lock()
@@ -44,16 +55,24 @@ class Journal:
 
     @asynccontextmanager
     async def running(self):
-        self.path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            lease = self.path.with_suffix(self.path.suffix + ".writer-lock").open("a+b")
+        except OSError as exc:
+            self.storage_issue = storage_issue(exc)
+            raise JournalError(self.storage_issue) from None
         # The OS releases the writer lease even after a process crash.
-        with self.path.with_suffix(self.path.suffix + ".writer-lock").open("a+b") as lease:
-            if sys.platform == "win32":
-                import msvcrt
-                lease.seek(0)
-                msvcrt.locking(lease.fileno(), msvcrt.LK_NBLCK, 1)
-            else:
-                import fcntl
-                fcntl.flock(lease, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        with lease:
+            try:
+                if sys.platform == "win32":
+                    import msvcrt
+                    lease.seek(0)
+                    msvcrt.locking(lease.fileno(), msvcrt.LK_NBLCK, 1)
+                else:
+                    import fcntl
+                    fcntl.flock(lease, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError:
+                raise JournalError("Capture writer lease is unavailable. Check for another observatory.") from None
             await self.io(self.start, time.time_ns())
             # Retain one idle WAL connection so each event commit doesn't
             # checkpoint solely because its short-lived writer is the last handle.
@@ -84,7 +103,8 @@ class Journal:
             return await asyncio.to_thread(operation, *args, **kwargs)
         except (OSError, sqlite3.Error) as exc:
             self.failures += 1
-            raise JournalError("Local capture I/O failed") from exc
+            self.storage_issue = storage_issue(exc)
+            raise JournalError(self.storage_issue) from None
 
     def start(self, now):
         with closing(self.db()) as db:
@@ -200,6 +220,7 @@ class Journal:
                     position = await asyncio.to_thread(operation, *args)
             except (OSError, sqlite3.Error) as exc:
                 self.failures += 1
+                self.storage_issue = storage_issue(exc)
                 self.publication_failed = True
                 raise JournalError("Local capture transaction failed") from exc
             committed = time.monotonic_ns()
@@ -250,6 +271,7 @@ class Journal:
     def diagnostics(self, now):
         latencies = sorted(self.commit_latency_ns)
         return {
+            "storage_status": self.storage_issue or "AVAILABLE",
             "batch_size": self.batch_size,
             "backlog_records": len(self.staged or ()),
             "high_water_records": self.high_water,

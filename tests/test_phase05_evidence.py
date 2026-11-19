@@ -44,6 +44,9 @@ def test_sanitized_attested_evidence_packet_on_real_socket(tmp_path):
         assert packet["replay"]["checkpoint_parity"] == "PASS"
         assert packet["coverage"]["gap_markers"]["mbp_gap"] == 1
         assert packet["coverage"]["rpc_outcomes"]["SNAPSHOT_APPLIED"] == 1
+        assert packet["capture"]["retention_basis"] == "SYNTHETIC"
+        assert packet["capture"]["requested_mode"] == packet["capture"]["effective_mode"] == "C"
+        assert packet["durability"]["receiver"]["visible_market_frames"] == diag["receiver"]["visible_market_frames"]
         assert packet["field_gates"] == {gate: "UNVERIFIED" for gate in
                                          ("real_gateway", "real_depth_entitlement", "real_capture")}
         assert verify_packet(packet, database, diagnostic=diag, checkpoint=snapshot)["checkpoint_parity"] == "PASS"
@@ -52,6 +55,10 @@ def test_sanitized_attested_evidence_packet_on_real_socket(tmp_path):
 
         counterfeit = deepcopy(packet)
         counterfeit["field_gates"]["real_gateway"] = "PASS"
+        with pytest.raises(ValueError, match="does not match"):
+            verify_packet(counterfeit, database, diagnostic=diag, checkpoint=snapshot)
+        counterfeit = deepcopy(packet)
+        del counterfeit["replay"]["state_sha256"]
         with pytest.raises(ValueError, match="does not match"):
             verify_packet(counterfeit, database, diagnostic=diag, checkpoint=snapshot)
         bad_diag = deepcopy(diag)

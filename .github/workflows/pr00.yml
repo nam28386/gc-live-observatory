@@ -2,7 +2,7 @@ name: Observatory synthetic validation
 
 on:
   push:
-    branches: [main, feat/phase01-live-ready, feat/phase02-microstructure-engine, feat/phase03-live-capture-reliability, feat/phase04-live-wave-research, feat/phase05-windows-live-commissioning]
+    branches: [main, feat/phase01-live-ready, feat/phase02-microstructure-engine, feat/phase03-live-capture-reliability, feat/phase04-live-wave-research, feat/phase05-windows-live-commissioning, feat/full-project-delivery]
   pull_request:
 
 permissions:
@@ -44,3 +44,41 @@ jobs:
             uv run --locked python -m pytest -q tests/test_phase03_recovery.py tests/test_phase04_recovery.py tests/test_phase05_rpc.py
             if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           }
+      - if: runner.os == 'Windows'
+        name: Build, verify and smoke the Windows source RC
+        shell: pwsh
+        run: |
+          $build = Join-Path $env:RUNNER_TEMP 'gc-release'
+          uv run --locked python -m scripts.build_windows_rc --sha $env:GITHUB_SHA --output $build
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $zip = @(Get-ChildItem $build -Filter '*.zip')
+          if ($zip.Count -ne 1) { throw 'Expected exactly one Windows RC ZIP' }
+          uv run --locked python -m scripts.build_windows_rc --sha $env:GITHUB_SHA --verify $zip[0].FullName
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $clean = Join-Path $env:RUNNER_TEMP 'GC Observatory Clean Install'
+          Expand-Archive -LiteralPath $zip[0].FullName -DestinationPath $clean
+          Push-Location $clean
+          try {
+            .\scripts\windows\install.ps1
+            uv run --locked python -m scripts.windows_acceptance --expected-sha $env:GITHUB_SHA
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          } finally { Pop-Location }
+      - if: runner.os == 'Windows'
+        name: Measure packaged synthetic capture and replay
+        shell: pwsh
+        run: |
+          $build = Join-Path $env:RUNNER_TEMP 'gc-release'
+          $clean = Join-Path $env:RUNNER_TEMP 'GC Observatory Clean Install'
+          Push-Location $clean
+          try {
+            uv run --locked python -m scripts.benchmark_phase03 --mode B --cycles 2000 --batch-size 32 | Tee-Object -FilePath (Join-Path $build 'synthetic-windows-burst-b.json')
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+            uv run --locked python -m scripts.benchmark_phase03 --mode C --cycles 2000 --batch-size 32 | Tee-Object -FilePath (Join-Path $build 'synthetic-windows-mixed-c.json')
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          } finally { Pop-Location }
+      - if: runner.os == 'Windows'
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-source-rc-${{ github.sha }}
+          path: ${{ runner.temp }}/gc-release/*
+          if-no-files-found: error
