@@ -11,3 +11,4 @@ data/
 *.duckdb
 *.sqlite*
 *.db
+*.writer-lock

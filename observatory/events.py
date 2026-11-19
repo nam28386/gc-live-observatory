@@ -1,6 +1,6 @@
 """The PR00 subset of the Fxaurum wire contract."""
 
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from decimal import Decimal
 from enum import StrEnum
 import time
@@ -27,6 +27,7 @@ class Aggressor(StrEnum):
 class Instrument:
     exchange: str
     symbol: str
+    expiry: str | None = None
 
     @property
     def streams(self) -> tuple[str, str]:
@@ -63,6 +64,7 @@ class MarketEvent:
         return {
             "exchange": self.instrument.exchange,
             "symbol": self.instrument.symbol,
+            "expiry": self.instrument.expiry,
             "observed": self.observed.wire(),
             "source": self.source,
             "quality_flags": list(self.quality_flags),
@@ -128,6 +130,20 @@ class BookTicker(MarketEvent):
     open_interest: int | None
     open_interest_valid: bool
     open_interest_time_us: int | None
+
+    def wire(self) -> dict:
+        return {
+            **self.wire_metadata(),
+            "quote": asdict(self.quote) if self.quote else None,
+            "quote_time_basis": "collector_observation",
+            "reported_last_ticks": self.reported_last_ticks,
+            "session_volume": self.session_volume,
+            "volume_valid": self.volume_valid,
+            "volume_time_us": self.volume_time_us,
+            "open_interest": self.open_interest,
+            "open_interest_valid": self.open_interest_valid,
+            "open_interest_time_us": self.open_interest_time_us,
+        }
 
 
 def integer(value: object, field: str, low: int = 0, high: int = 2**63 - 1) -> int:

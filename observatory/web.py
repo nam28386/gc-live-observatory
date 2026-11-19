@@ -1,15 +1,17 @@
 """Loopback FastAPI app wired to the synthetic gateway and collector."""
 
 import asyncio
-from contextlib import asynccontextmanager, suppress
+from contextlib import AsyncExitStack, asynccontextmanager, suppress
 from pathlib import Path
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
+from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 from .collector import Collector
-from .events import MOCK_GC, Observation
+from .events import Instrument, MOCK_GC, Observation
+from .journal import Journal, JournalError
 from .mock_gateway import MockGateway
 from .state import ObservatoryState
 
@@ -17,15 +19,30 @@ STATIC = Path(__file__).with_name("static")
 
 
 def create_app(
-    *, interval: float = 0.16, disconnect_after: int | None = None
+    *, interval: float = 0.16, disconnect_after: int | None = None,
+    instrument: Instrument = MOCK_GC, live_gateway_port: int | None = None,
+    capture_path: Path | None = None, retention_days: int = 7,
+    stale_after: float = 3.0,
 ) -> FastAPI:
-    state = ObservatoryState(MOCK_GC)
-    gateway = MockGateway(MOCK_GC, interval, disconnect_after)
+    live = live_gateway_port is not None
+    state = ObservatoryState(instrument, stale_after=stale_after, live=live)
+    journal = Journal(capture_path, {
+        "source": state.source, "exchange": instrument.exchange,
+        "symbol": instrument.symbol, "expiry": instrument.expiry,
+        "protocol_revision": "581cb6b3706c93ccd1667b32234e904654a44728",
+    }, retention_days) if capture_path is not None else None
 
     @asynccontextmanager
     async def lifespan(_: FastAPI):
-        async with gateway.running() as endpoint:
-            collector = asyncio.create_task(Collector(endpoint, state).run())
+        async with AsyncExitStack() as stack:
+            if journal:
+                await stack.enter_async_context(journal.running())
+            if live:
+                endpoint = f"ws://127.0.0.1:{live_gateway_port}/"
+            else:
+                gateway = MockGateway(instrument, interval, disconnect_after)
+                endpoint = await stack.enter_async_context(gateway.running())
+            collector = asyncio.create_task(Collector(endpoint, state, journal=journal).run())
             try:
                 yield
             finally:
@@ -33,7 +50,20 @@ def create_app(
                 with suppress(asyncio.CancelledError):
                     await collector
 
+    async def current_snapshot(*, full: bool) -> dict:
+        now = Observation.now()
+        snapshot = state.snapshot(now) if full else {"status": state.status(now)}
+        status = snapshot["status"]
+        status["recorder"] = {
+            "enabled": journal is not None,
+            "session_id": journal.session if journal else None,
+            "durable_events": journal.written if journal else 0,
+            "failures": journal.failures if journal else 0,
+        }
+        return snapshot
+
     app = FastAPI(lifespan=lifespan, docs_url=None, redoc_url=None, openapi_url=None)
+    app.add_middleware(TrustedHostMiddleware, allowed_hosts=["127.0.0.1", "localhost"] if live else ["*"])
     app.mount("/static", StaticFiles(directory=STATIC), name="static")
 
     @app.get("/", response_class=FileResponse)
@@ -42,18 +72,33 @@ def create_app(
 
     @app.get("/api/status")
     async def status():
-        return state.status(Observation.now())
+        return (await current_snapshot(full=False))["status"]
 
     @app.get("/api/snapshot")
     async def snapshot():
-        return state.snapshot(Observation.now())
+        return await current_snapshot(full=True)
+
+    @app.get("/api/history")
+    async def history(after: int = Query(0, ge=0, le=2**63 - 1),
+                      limit: int = Query(100, ge=1, le=250), gaps: bool = False):
+        if journal is None:
+            raise HTTPException(404, "Local capture is disabled")
+        try:
+            records = await journal.io(journal.history, after, limit, gaps=gaps)
+        except JournalError:
+            raise HTTPException(503, "Local capture is unavailable") from None
+        return {"records": records}
 
     @app.websocket("/ws")
     async def updates(websocket: WebSocket):
+        origin = websocket.headers.get("origin")
+        if live and origin is not None and origin != f"http://{websocket.headers.get('host')}":
+            await websocket.close(code=1008)
+            return
         await websocket.accept()
         try:
             while True:
-                await asyncio.wait_for(websocket.send_json(state.snapshot(Observation.now())), timeout=1)
+                await asyncio.wait_for(websocket.send_json(await current_snapshot(full=True)), timeout=1)
                 # The dashboard consumes snapshots, which also refresh freshness
                 # states during upstream silence. It cannot send gateway commands.
                 try:

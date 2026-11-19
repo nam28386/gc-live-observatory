@@ -5,6 +5,7 @@ const time = new Intl.DateTimeFormat("en-GB", {
   hour: "2-digit", minute: "2-digit", timeZone: "UTC",
 });
 let currentSnapshot;
+let lastTimelineRefresh = 0;
 
 function show(id, text) {
   const node = document.getElementById(id);
@@ -101,7 +102,19 @@ function update(snapshot) {
   currentSnapshot = snapshot;
   const { status, trade, bbo } = snapshot;
   const tickSize = Number(status.tick_size);
-  show("instrument", status.exchange + " · " + status.symbol + " · simulated clock (UTC)");
+  show("source", status.mode === "LIVE" ? "LIVE / FXAURUM" : "MOCK / SYNTHETIC");
+  show("instrument", status.exchange + " · " + status.symbol +
+    (status.expiry ? " · expiry " + status.expiry : " · simulated clock") + " (UTC)");
+  show("last-volume", received(status.last_volume_update));
+  const recorder = status.recorder;
+  show("recorder", status.recorder_error ? "Capture failed · collector stopped" :
+    recorder.enabled ? recorder.durable_events + " durable records" : "Capture off");
+  show("issues", status.last_issue ? status.last_issue + " · " + status.counters[status.last_issue] : "—");
+  document.getElementById("recorder").classList.toggle("warning", status.recorder_error);
+  if (recorder.enabled && Date.now() - lastTimelineRefresh > 2000) {
+    lastTimelineRefresh = Date.now();
+    refreshTimeline();
+  }
   show("trade", trade ? price(trade.price_ticks, tickSize) : "—");
   show("quote", bbo ? price(bbo.bid_ticks, tickSize) + " × " + price(bbo.ask_ticks, tickSize) : "—");
   show("spread", bbo ? bbo.spread_ticks + " ticks" : "—");
@@ -121,6 +134,32 @@ function update(snapshot) {
   show("gaps", count + (openGap ? " · open gap" : count ? " · historical gaps retained" : ""));
   document.getElementById("gaps").classList.toggle("warning", count > 0);
   for (const panel of panels) draw(panel, snapshot.candles[panel.dataset.frame], tickSize);
+}
+
+async function refreshTimeline() {
+  const timeline = document.getElementById("timeline");
+  timeline.hidden = false;
+  const list = document.getElementById("timeline-entries");
+  try {
+    const response = await fetch("/api/history?gaps=true&limit=12", { cache: "no-store" });
+    if (!response.ok) throw new Error("Capture history unavailable");
+    const { records } = await response.json();
+    const labels = { gap: "Capture interrupted", restart_gap: "Recorder restarted",
+      coverage_start: "Market data observed" };
+    list.replaceChildren(...records.map(record => {
+      const row = document.createElement("li");
+      const start = record.payload.from_utc_ns;
+      row.textContent = received(record) + " · " + labels[record.kind] +
+        (start ? " · previous capture ended " + received({ utc_ns: start }) : "") +
+        (record.payload.reason ? " · " + record.payload.reason : "") +
+        " · " + record.provenance.symbol + " (" + record.provenance.source + ")";
+      return row;
+    }));
+  } catch {
+    const row = document.createElement("li");
+    row.textContent = "Capture history unavailable";
+    list.replaceChildren(row);
+  }
 }
 
 function connect() {

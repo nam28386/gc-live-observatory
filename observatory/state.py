@@ -58,8 +58,13 @@ class Coverage:
 
 
 class ObservatoryState:
-    def __init__(self, instrument: Instrument, stale_after: float = 3.0) -> None:
+    def __init__(self, instrument: Instrument, stale_after: float = 3.0, *, live: bool = False) -> None:
         self.instrument = instrument
+        self.live = live
+        self.source = "fxaurum_rithmic" if live else "fxaurum_mock"
+        self.recorder_error = False
+        self.last_volume_update: Observation | None = None
+        self.volume: tuple[int, int | None] | None = None
         self.stale_after_ns = int(stale_after * 1_000_000_000)
         self.connected = False
         self.request_id: int | None = None
@@ -184,6 +189,15 @@ class ObservatoryState:
                 self.quote = quote
                 self.quote_in_session = ticker.observed
                 self.observe_market(ticker.observed)
+        if ticker.volume_valid:
+            value = (ticker.session_volume, ticker.volume_time_us)
+            if self.volume is None or (
+                value != self.volume and (
+                    self.volume[1] is None or value[1] is None or value[1] >= self.volume[1]
+                )
+            ):
+                self.volume = value
+                self.last_volume_update = ticker.observed
         if ticker.open_interest_valid:
             value = (ticker.open_interest, ticker.open_interest_time_us)
             if self.oi is not None:
@@ -211,8 +225,10 @@ class ObservatoryState:
         if self.connected and self.ack and self.quote_problem:
             book_freshness = self.quote_problem
         return {
-            "mode": "MOCK",
-            "source": "fxaurum_mock",
+            "mode": "LIVE" if self.live else "MOCK",
+            "source": self.source,
+            "expiry": self.instrument.expiry,
+            "recorder_error": self.recorder_error,
             "exchange": self.instrument.exchange,
             "symbol": self.instrument.symbol,
             "tick_size": str(GC_TICK),
@@ -226,6 +242,7 @@ class ObservatoryState:
             "last_bbo_message": wire(ticker.observed if ticker else None),
             "last_bbo_change": wire(self.last_bbo_change),
             "last_oi_update": wire(self.last_oi_update),
+            "last_volume_update": wire(self.last_volume_update),
             "market_freshness": self.freshness(self.market_in_session, now),
             "trade_freshness": self.freshness(self.trade_in_session, now),
             "bbo_freshness": book_freshness,

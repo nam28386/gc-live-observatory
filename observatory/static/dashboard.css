@@ -53,3 +53,6 @@ canvas { width: 100%; height: clamp(150px, 23vh, 260px); display: block; }
   .charts { grid-template-columns: 1fr; }
   main { padding-top: 18px; }
 }
+#timeline { padding: 8px 0; }
+#timeline h2 { font-size: .9rem; }
+#timeline li { color: var(--muted); font-size: .8rem; margin-block: .35rem; }

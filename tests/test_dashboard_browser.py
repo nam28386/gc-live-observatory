@@ -23,6 +23,7 @@ def app_url(tmp_path):
         process = subprocess.Popen([
             sys.executable, "-m", "observatory", "mock", "--port", str(port),
             "--interval", "0.025", "--disconnect-after", "25",
+            "--capture", str(tmp_path / "browser.sqlite"),
         ], cwd=ROOT, stdout=log, stderr=subprocess.STDOUT)
         try:
             deadline = time.monotonic() + 10
@@ -66,6 +67,8 @@ def test_every_canvas_updates_from_mock_websocket_and_gap_is_visible(app_url):
         expect(page.locator("#spread")).to_have_text("2 ticks")
         expect(page.locator("#ack")).to_have_text("Acknowledged #2", timeout=10_000)
         expect(page.locator("#gaps")).to_have_text("1 · historical gaps retained")
+        expect(page.locator("#recorder")).to_contain_text("durable records")
+        expect(page.locator("#timeline-entries")).to_contain_text("Capture interrupted")
         canvases = page.locator("canvas")
         expect(canvases).to_have_count(4)
         page.wait_for_function(

@@ -1,8 +1,8 @@
-name: PR00 MOCK validation
+name: Observatory synthetic validation
 
 on:
   push:
-    branches: [main]
+    branches: [main, feat/phase01-live-ready]
   pull_request:
 
 permissions:
@@ -28,3 +28,12 @@ jobs:
         env:
           PR00_REQUIRE_BROWSER: "1"
         run: uv run --locked python -m pytest -q -m browser -rs
+      - if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          Get-ChildItem scripts/windows/*.ps1 | ForEach-Object {
+            $tokens = $null
+            $errors = $null
+            [System.Management.Automation.Language.Parser]::ParseFile($_.FullName, [ref]$tokens, [ref]$errors) | Out-Null
+            if ($errors) { throw ($errors | Out-String) }
+          }

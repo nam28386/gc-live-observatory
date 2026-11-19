@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>GC Live Observatory | MOCK</title>
+  <title>GC Live Observatory</title>
   <link rel="stylesheet" href="/static/dashboard.css">
   <script src="/static/dashboard.js" defer></script>
 </head>
@@ -15,7 +15,7 @@
         <p id="instrument">COMEX gold futures</p>
       </div>
       <div class="top-status">
-        <span class="mock">MOCK / SYNTHETIC</span>
+        <span class="mock" id="source">Awaiting source</span>
         <output id="delivery" aria-live="polite">Connecting to dashboard stream</output>
       </div>
     </header>
@@ -44,7 +44,14 @@
       <div><span>Last BBO message observed</span><output id="last-bbo">—</output></div>
       <div><span>Last BBO price/size change observed</span><output id="last-bbo-change">—</output></div>
       <div><span>Last OI update observed</span><output id="last-oi">—</output></div>
+      <div><span>Last volume update observed</span><output id="last-volume">—</output></div>
+      <div><span>Recorder</span><output id="recorder">—</output></div>
+      <div><span>Collector diagnostics</span><output id="issues">—</output></div>
       <div><span>Capture gaps</span><output id="gaps">—</output></div>
+    </section>
+    <section id="timeline" hidden aria-label="Persistent capture timeline">
+      <h2>Local capture timeline</h2>
+      <ol id="timeline-entries"></ol>
     </section>
   </main>
 </body>

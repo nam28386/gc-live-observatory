@@ -31,3 +31,7 @@ uv run --locked python -m pytest -q -m browser -rs
 On Linux, use `playwright install --with-deps chromium` if Chromium system dependencies are missing. The browser test also accepts system Chromium or an executable path in `PR00_CHROMIUM`. Set `PR00_REQUIRE_BROWSER=1` to make an unavailable browser fail the test.
 
 The acceptance details, measurement policy and Windows handoff are in [PR00 contracts](docs/PR00_CONTRACTS.md). The [implementation playbook](docs/GC_LIVE_OBSERVATORY_CODEX_CLOUD_PLAYBOOK_2026-11-19.md) and [v1.0 acceptance prompt](docs/GC_CODEX_CLOUD_MASTER_PROMPT_2026-11-19.md) describe the broader project.
+
+## Windows LIVE
+
+Use an explicitly selected COMEX GC contract and expiry with the loopback Fxaurum adapter. The [Windows operator guide](docs/WINDOWS_LIVE_VALIDATION.md) covers installation, launch, smoke and graceful stop. The [Phase 01 architecture](docs/PHASE01_ARCHITECTURE.md) describes optional local recording and its HTTP history API.
