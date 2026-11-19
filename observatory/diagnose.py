@@ -25,6 +25,7 @@ def diagnostic(status, gateway_reachable=None, *, features=None, expiry_verified
     mbp = features.get("mbp", {})
     receiver = status.get("receiver", {})
     ready = status["market_data_mode"]
+    requested = status["requested_market_data_mode"]
     gate_a = (status["transport_connected"] and status["subscribe_ack"]
               and status["request_id"] == status["last_ack_request_id"]
               and status["trade_freshness"] == status["bbo_freshness"] == "OBSERVED")
@@ -46,8 +47,9 @@ def diagnostic(status, gateway_reachable=None, *, features=None, expiry_verified
         "subscribe_ack": "Matching ACK" if ack else "No correlated ACK",
         "trade": status["trade_freshness"],
         "bbo": status["bbo_freshness"],
-        "mbp": depths["mbp"],
-        "dbo_observation": depths["dbo"],
+        "mbp": ("Depth not requested" if requested == "A" else
+                "Valid book and OFI window" if gate_b else f"MBP {depths['mbp']}; waiting for valid depth and OFI"),
+        "dbo_observation": ("DBO not requested" if requested != "C" else f"DBO status {depths['dbo']}"),
         "actual_gateway_and_entitlement": "Needs independent authorized operator evidence",
         "capture_io": "Capture disabled" if not recorder.get("enabled") else
             "Recorder failed" if status["recorder_error"] else
@@ -58,7 +60,7 @@ def diagnostic(status, gateway_reachable=None, *, features=None, expiry_verified
         "git_sha": status["software_revision"], "os": platform.system(), "python": platform.python_version(),
         "os_release": platform.release(), "os_version": platform.version(),
         "source": status["mode"], "effective_mode": status["market_data_mode"],
-        "requested_mode": status["requested_market_data_mode"],
+        "requested_mode": requested,
         "contract": {key: status[key] for key in ("exchange", "symbol", "expiry")},
         "expiry_verification": "OPERATOR_ATTESTED" if live and expiry_verified else "UNVERIFIED",
         "gateway_tcp_reachable": gateway_reachable,
@@ -84,8 +86,10 @@ def diagnostic(status, gateway_reachable=None, *, features=None, expiry_verified
             "subscribe_ack": "PASS" if ack else "FAIL",
             "trade": "PASS" if status["trade_freshness"] == "OBSERVED" else "UNVERIFIED",
             "bbo": "PASS" if status["bbo_freshness"] == "OBSERVED" else "UNVERIFIED",
-            "mbp": "PASS" if depths["mbp"] == "VALID_BOOK" and quality["last_valid_mbp"] else "UNVERIFIED",
-            "dbo_observation": "PASS" if quality["last_valid_dbo"] and "mbo" not in quality["missing_sources"] else "UNVERIFIED",
+            "mbp": "NOT_APPLICABLE" if requested == "A" else "PASS" if gate_b else
+                   "PARTIAL" if depths["mbp"] == "VALID_BOOK" else "UNVERIFIED",
+            "dbo_observation": "NOT_APPLICABLE" if requested != "C" else "PASS" if gate_c else
+                               "PARTIAL" if depths["dbo"] == "OPERATOR_REPORTED" else "UNVERIFIED",
             "actual_gateway_and_entitlement": "UNVERIFIED",
             "capture_io": "FAIL" if status["recorder_error"] else "PASS" if recorder.get("durable_events")
                           else "UNVERIFIED" if recorder.get("enabled") else "NOT_APPLICABLE",

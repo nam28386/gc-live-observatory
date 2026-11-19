@@ -94,6 +94,7 @@ def test_finite_burst_recovery_under_full_commit_pressure(tmp_path, monkeypatch)
     ("none", "RPC_RECEIPT_TIMEOUT", 3),
     ("wrong_id", "RPC_RECEIPT_TIMEOUT", 3),
     ("wrong_generation", "RPC_GENERATION_MISMATCH", 3),
+    ("malformed", "RPC_RESPONSE_INVALID", 3),
     ("insufficient", "RPC_SEQUENCE_INSUFFICIENT", 3),
     ("late", "RPC_RECEIPT_TIMEOUT", 3),
     ("close", "RPC_TRANSPORT_INTERRUPTED", 1),
@@ -123,6 +124,8 @@ def test_correlated_rpc_outcomes_and_permanent_gap(reply, expected, attempts, tm
                 result = {"id": rpc["id"] + (1000 if reply == "wrong_id" else 0),
                           "result": {"type": "Image", "gen": 2 if reply == "wrong_generation" else 1,
                                      "seq": 0 if reply == "insufficient" else 2, "src": 1, "rows": []}}
+                if reply == "malformed":
+                    result["result"].pop("rows")
                 if reply == "late":
                     if late:
                         await socket.send(json.dumps(late))
@@ -209,3 +212,17 @@ def test_snapshot_commit_failure_does_not_publish_or_claim_application(tmp_path)
             assert not any(row["kind"] in ("depth_snapshot", "mbp_recovery") for row in rows)
             assert any(row["kind"] == "mbp_gap" for row in rows)
     asyncio.run(scenario())
+
+
+def test_reconnect_during_batch_does_not_count_committed_frames_as_uncertain(tmp_path):
+    from argparse import Namespace
+    from scripts.benchmark_phase03 import run
+
+    result = run(Namespace(mode="B", cycles=90, levels=20, pace=0, burst=64, reconnect_every=30,
+                           gap_every=18), tmp_path / "reconnect.sqlite", batch_size=32)
+    receiver = result["receiver"]
+    assert result["planned_connections"] == 3
+    assert result["recovery_replies"] == 5
+    assert receiver["uncertain_received_frames"] == 0
+    assert receiver["admitted_queue_frames"] == receiver["settled_queue_frames"]
+    assert result["durable_gap_records"] >= 7

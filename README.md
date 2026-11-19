@@ -66,3 +66,7 @@ Start the synthetic dashboard with `uv run --locked python -m observatory mock -
 After extracting a strict local H-GC-001 dataset, run `uv run --locked python -m observatory.evaluate <dataset-directory>` to check eligibility and provenance. Only use `--confirm-permitted-data` with data permitted for empirical evaluation. The handler refuses mock datasets and locks a successful holdout evaluation in that directory.
 
 The [commissioning guide](docs/WINDOWS_LIVE_VALIDATION.md) covers the local physical checks. [Phase 04 evidence](docs/PHASE04_EVIDENCE.md) records synthetic and remote verification separately.
+
+## Phase 05 field evidence
+
+Use the existing Windows scripts to run A, then B, and C after positive local DBO entitlement. [Windows commissioning](docs/WINDOWS_LIVE_VALIDATION.md) documents the sanitized diagnostic and evidence-packet commands. The packet verifier reads an exact local SQLite prefix and can compare it to a private API checkpoint. Its field gates remain unverified without independent evidence. [Phase 05 validation and capacity measurements](docs/PHASE05_EVIDENCE.md)

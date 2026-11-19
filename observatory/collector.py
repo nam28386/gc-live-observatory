@@ -557,11 +557,13 @@ class Collector:
                 for decoded in frames:
                     self.state.last_any = decoded[1]
                     await self.process(*decoded)
-        self.visible_market_frames = self.normalized_market_frames
-        self.accounted_queue_frames += len(frames)
-        if self.micro:
-            published = Observation.now().monotonic_ns
-            self.micro.availability_ns.extend(published - row[1].monotonic_ns for row in frames)
+            # A terminal socket event can unwind frame gathering. The batch
+            # above still committed, so settle it before re-raising that event.
+            self.visible_market_frames = self.normalized_market_frames
+            self.accounted_queue_frames += len(frames)
+            if self.micro:
+                published = Observation.now().monotonic_ns
+                self.micro.availability_ns.extend(published - row[1].monotonic_ns for row in frames)
         return carried, closed
 
     async def apply_book(self, event, kind, raw):

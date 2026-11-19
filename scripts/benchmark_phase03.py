@@ -134,12 +134,15 @@ def run(args, path, **options):
             snapshot = client.get("/api/snapshot").json()
             status = snapshot["status"]
             count = snapshot["microstructure"]["diagnostics"]["stream_frames_processed"]
-            if (count >= expected and source.send_ended is not None) or status["recorder_error"]:
+            recv = status["receiver"]
+            recovery_done = recv["depthsnap_rpc"]["counts"].get("SNAPSHOT_APPLIED", 0) >= source.recovery_replies
+            settled = recv["admitted_queue_frames"] == recv["settled_queue_frames"]
+            if (count >= expected and source.send_ended is not None and recovery_done and settled) or status["recorder_error"]:
                 break
             time.sleep(.01)
         elapsed = time.perf_counter() - source.send_started
-        if count != expected:
-            raise RuntimeError(f"Expected {expected} processed frames, got {count}, {status['counters']}")
+        if count != expected or not recovery_done or not settled:
+            raise RuntimeError(f"Expected {expected} settled market frames, got {count}, {status['counters']}")
         with client.websocket_connect("/ws") as ws:
             assert ws.receive_json()["microstructure"]["diagnostics"]["stream_frames_processed"] == expected
         session = status["recorder"]["session_id"]

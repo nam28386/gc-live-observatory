@@ -69,6 +69,7 @@ def test_depthsnap_receipt_is_not_timed_out_while_durable_writer_is_blocked(tmp_
                 assert micro.depth.counts["rpc_timeout"] == 0
                 assert collector.recovery_receipt_ms < 200 < collector.recovery_dispatch_ms
                 assert collector.recovery_publication_ms >= collector.recovery_dispatch_ms
+                assert collector.rpc.recent[-1]["outcomes"] == ["RPC_DISPATCH_DELAY", "SNAPSHOT_APPLIED"]
                 assert collector.receive_high_water <= RECEIVE_QUEUE
                 rows = journal.history()
                 assert [row["kind"] for row in rows].index("trade") < [row["kind"] for row in rows].index("depth_snapshot")

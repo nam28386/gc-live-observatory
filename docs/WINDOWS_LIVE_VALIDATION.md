@@ -72,3 +72,35 @@ uv run --locked python -m observatory.diagnose --port 8000 --gateway-port 9001 -
 For B, substitute `-Mode B` and `--require-mode B`. The smoke script now requires a valid OFI window in addition to MBP progress. For C, use `-Mode C -MboEntitled` only after a positive probe, then `--require-mode C`. An absence of DBO entitlement leaves A/B usable. Compare the reported exact and inferred counts without requiring an inferred fill to occur. The probe status in a report is an operator assertion, with observed stream readiness reported separately.
 
 Add `-Capture -BatchSize 32` only after confirming rights. Review queue pressure, uncertain receipt counts, p95/p99 commit and publication latency, and all three depthSnap timing intervals. `--output` can write the sanitized diagnostic to a new private path outside Git. Never include raw event payloads in pilot evidence. Verify loopback stop behavior and retain the report and exact SHA separately from licensed data.
+
+## Phase 05 field commissioning and evidence
+
+1. Verify the clean checkout uses the exact approved SHA. Run `.\scripts\windows\install.ps1` from the repository root.
+2. Check contract and expiry independently. Run `.\scripts\windows\preflight.ps1`, then `.\scripts\windows\run-live.ps1 -Symbol $Symbol -Expiry $Expiry -Mode A`. Leave capture disabled until retention and usage rights are confirmed.
+3. In a second terminal, run `.\scripts\windows\smoke.ps1 -Symbol $Symbol -Expiry $Expiry -Mode A`. Check the four charts update. To save the diagnostic on success or readiness timeout, add `-DiagnosticPath $Diagnostic` using a new local path outside Git. Only add `-ExpiryAttested` after independently checking the exact expiry.
+4. Repeat B after A. Confirm fresh MBP updates and valid OFI. Run the existing operator-only `uv run --locked python -m observatory mbo-probe --symbol $Symbol --expiry $Expiry` before C. Only use C with `-MboEntitled` after a positive result. Preserve usable A/B if C is unavailable.
+5. Review the requested/effective mode, queue age and uncertain counts, and RPC receipt/dispatch/publication timing. Use `.\scripts\windows\stop.ps1` to verify graceful shutdown.
+
+The diagnostic is also available independently without capture:
+
+```powershell
+uv run --locked python -m observatory.diagnose --port 8000 --gateway-port 9001 --require-mode A --wait-seconds 30
+```
+
+Run the full socket-to-recorder-to-API benchmark using synthetic data before a permitted recording:
+
+```powershell
+uv run --locked python -m scripts.benchmark_phase03 --mode B --cycles 2000 --batch-size 32
+uv run --locked python -m scripts.benchmark_phase03 --mode B --cycles 30000 --levels 750 --pace .025 --burst 100
+```
+
+The output labels the local Windows synthetic capacity separately from observed real capture rate and unverified production capacity. Windows RSS uses working set. Database growth is logical file bytes/s and does not measure physical disk write bandwidth.
+
+After a **permitted** capture, the diagnostic contains a session ID and durable position. Keep the original database outside Git. The following commands pin that exact prefix. A private checkpoint is optional and must be saved from `/api/snapshot` at the **same** session and position. It can contain prices and remains local. Use UTF-8 for the JSON files.
+
+```powershell
+uv run --locked python -m observatory.evidence build $Session $Database --diagnostic $Diagnostic --output $Packet
+uv run --locked python -m observatory.evidence verify $Packet $Database --diagnostic $Diagnostic
+```
+
+If using a private checkpoint, add `--checkpoint $Checkpoint` to both calls. The verifier compares the reconstructed market state at its recorded observation time. With no checkpoint it reports successful prefix reconstruction and leaves live/replay parity unverified. The packet contains allowlisted aggregate counts, digests and gate summaries. Share it only through the approved evidence channel. Keep the database, private checkpoint and source payloads local.
