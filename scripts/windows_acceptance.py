@@ -32,16 +32,51 @@ def fetch(port, route):
 
 def polling(server, port, ready):
     deadline = time.monotonic() + 25
+    last_snapshot = None
+    last_fetch_error = None
     while time.monotonic() < deadline and server.poll() is None:
         try:
             snapshot = json.loads(fetch(port, "/api/snapshot"))
-        except OSError:
-            pass
+        except (OSError, ValueError) as exc:
+            last_fetch_error = type(exc).__name__
         else:
+            last_snapshot = snapshot
             if ready(snapshot):
                 return snapshot
         time.sleep(.05)
-    raise RuntimeError("Synthetic subprocess did not reach the requested readiness state")
+    # The full server log is printed by launch() on error. Report only
+    # bounded, synthetic, non-price operational state from the final snapshot.
+    summary = {"server_exit": server.poll(), "fetch_error": last_fetch_error}
+    if last_snapshot is not None:
+        status = last_snapshot.get("status", {})
+        micro = last_snapshot.get("microstructure", {})
+        receiver = status.get("receiver", {})
+        book = micro.get("mbp", {})
+        ofi = micro.get("ofi", {})
+        summary.update({
+            "mode": status.get("market_data_mode"),
+            "request_id": status.get("request_id"),
+            "last_ack_request_id": status.get("last_ack_request_id"),
+            "eligible_trade": status.get("counters", {}).get("eligible_trade"),
+            "transport_gap_count": status.get("quality", {}).get("transport_gap_count"),
+            "queue_admitted": receiver.get("admitted_queue_frames"),
+            "queue_settled": receiver.get("settled_queue_frames"),
+            "queue_uncertain": receiver.get("uncertain_received_frames"),
+            "rpc_counts": receiver.get("depthsnap_rpc", {}).get("counts", {}),
+            "rpc_recent_outcomes": [
+                item.get("outcome")
+                for item in receiver.get("depthsnap_rpc", {}).get("recent", [])[-4:]
+            ],
+            "ofi_status": ofi.get("status"),
+            "book_status": book.get("status"),
+            "book_gaps": book.get("counts", {}).get("gaps"),
+            "recorder_error": status.get("recorder_error"),
+            "recorder_failures": status.get("recorder", {}).get("failures"),
+        })
+    raise RuntimeError(
+        "Synthetic subprocess did not reach the requested readiness state: "
+        + json.dumps(summary, sort_keys=True)
+    )
 
 
 def powershell(shell, script, *args):
