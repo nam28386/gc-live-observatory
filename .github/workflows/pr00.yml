@@ -91,6 +91,39 @@ jobs:
             if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           } finally { Pop-Location }
       - if: runner.os == 'Windows'
+        name: Summarize public Windows RC evidence
+        shell: pwsh
+        run: |
+          $build = Join-Path $env:RUNNER_TEMP 'gc-release'
+          $release = Get-Content (Join-Path $build 'build-windows-py312.json') -Raw | ConvertFrom-Json
+          $acceptance = Get-Content (Join-Path $build 'acceptance-windows-py312.json') -Raw | ConvertFrom-Json
+          $stress = Get-Content (Join-Path $build 'restart-windows-py312.json') -Raw | ConvertFrom-Json
+          if ($release.source_sha -ne $env:GITHUB_SHA -or $acceptance.sha -ne $env:GITHUB_SHA -or
+              $stress.sha -ne $env:GITHUB_SHA -or $stress.restart_pairs -ne 4) {
+            throw 'Release evidence identity or repeat count mismatch'
+          }
+          @(
+            '## Windows source RC'
+            "- Commit: $($release.source_sha)"
+            "- Inner ZIP: $($release.file), $($release.bytes) bytes"
+            "- Inner SHA256: $($release.sha256)"
+            "- Build basis: $($release.build_os), Python $($release.python), $($release.git), $($release.zip_encoding) ZIP"
+            "- Standard synthetic acceptance: $($acceptance.capture_replay_evidence_restart)"
+            "- Synthetic restart pairs: $($stress.restart_pairs)"
+            '| Pair | Scenario | Seconds | Exit | Listener closed | Stop marker removed | Durable market frames | Replay parity |'
+            '| --- | --- | ---: | ---: | --- | --- | ---: | --- |'
+            foreach ($case in $stress.scenarios) {
+              "| $($case.pair) | $($case.scenario) | $($case.duration_seconds) | $($case.launcher_exit) | $($case.listener_closed) | $($case.stop_marker_removed) | $($case.settled_market_frames) | $($case.checkpoint_parity) |"
+            }
+            ''
+            '| Synthetic benchmark | Market frames | Durable frames/s | Replay records/s | Queue high | Uncertain |'
+            '| --- | ---: | ---: | ---: | ---: | ---: |'
+            foreach ($workload in @('burst-b', 'mixed-c')) {
+              $row = Get-Content (Join-Path $build "synthetic-windows-$workload.json") -Raw | ConvertFrom-Json
+              "| $workload | $($row.processed_stream_frames) | $($row.durable_market_events_per_second) | $($row.replay_records_per_second) | $($row.receiver.receive_queue_high_water) | $($row.receiver.uncertain_received_frames) |"
+            }
+          ) | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Append
+      - if: runner.os == 'Windows'
         uses: actions/upload-artifact@v4
         with:
           name: windows-py312-source-rc-${{ github.sha }}
