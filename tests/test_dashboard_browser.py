@@ -64,6 +64,7 @@ def test_every_canvas_updates_from_mock_websocket_and_gap_is_visible(app_url, mo
         page.on("pageerror", lambda error: errors.append(str(error)))
         page.goto(app_url, wait_until="domcontentloaded")
         expect(page.get_by_text("MOCK / SYNTHETIC")).to_be_visible()
+        expect(page.locator("#source")).to_have_attribute("data-source", "MOCK")
         expect(page.locator("#instrument")).to_contain_text("COMEX · GCZ6")
         expect(page.locator("#spread")).to_have_text("2 ticks")
         expect(page.get_by_label("Capture operations")).to_be_visible()

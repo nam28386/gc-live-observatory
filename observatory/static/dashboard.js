@@ -138,6 +138,7 @@ function update(snapshot) {
   const { status, trade, bbo } = snapshot;
   const tickSize = Number(status.tick_size);
   show("source", status.mode === "LIVE" ? "LIVE / FXAURUM" : "MOCK / SYNTHETIC");
+  document.getElementById("source").dataset.source = status.mode;
   show("instrument", status.exchange + " · " + status.symbol +
     (status.expiry ? " · expiry " + status.expiry +
       (status.expiry_attestation === "OPERATOR_ATTESTED" ? " · operator attested" : " · unverified")
