@@ -147,7 +147,7 @@ class Journal:
         sql = """SELECT r.*, s.provenance FROM records r JOIN sessions s ON r.session_id = s.id
                  WHERE r.id > ?"""
         if gaps:
-            sql += " AND r.kind IN ('gap', 'restart_gap', 'coverage_start')"
+            sql += " AND r.kind IN ('gap', 'restart_gap', 'coverage_start', 'mbp_gap', 'mbp_recovery')"
         sql += " ORDER BY r.id DESC LIMIT ?" if gaps else " ORDER BY r.id LIMIT ?"
         with closing(self.db()) as db:
             records = db.execute(sql, (after, limit)).fetchall()

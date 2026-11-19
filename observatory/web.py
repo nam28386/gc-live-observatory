@@ -12,6 +12,7 @@ from starlette.middleware.trustedhost import TrustedHostMiddleware
 from .collector import Collector
 from .events import Instrument, MOCK_GC, Observation
 from .journal import Journal, JournalError
+from .microstructure import Microstructure
 from .mock_gateway import MockGateway
 from .state import ObservatoryState
 
@@ -22,15 +23,27 @@ def create_app(
     *, interval: float = 0.16, disconnect_after: int | None = None,
     instrument: Instrument = MOCK_GC, live_gateway_port: int | None = None,
     capture_path: Path | None = None, retention_days: int = 7,
-    stale_after: float = 3.0,
+    stale_after: float = 3.0, mode: str = "A", mbo_entitled: bool = False,
 ) -> FastAPI:
     live = live_gateway_port is not None
+    if mode not in ("A", "B", "C"):
+        raise ValueError("Unknown market data mode")
+    requested_mode = mode
+    if live and mode == "C" and not mbo_entitled:
+        mode = "B"
     state = ObservatoryState(instrument, stale_after=stale_after, live=live)
     journal = Journal(capture_path, {
         "source": state.source, "exchange": instrument.exchange,
         "symbol": instrument.symbol, "expiry": instrument.expiry,
         "protocol_revision": "581cb6b3706c93ccd1667b32234e904654a44728",
     }, retention_days) if capture_path is not None else None
+
+    micro = Microstructure(mode, instrument, state.source, state.stale_after_ns)
+    if mode == "C":
+        micro.entitlement = "OPERATOR_REPORTED" if live else "SYNTHETIC"
+    elif requested_mode == "C":
+        micro.entitlement = "UNVERIFIED"
+    micro.capture_id = journal.session if journal else None
 
     @asynccontextmanager
     async def lifespan(_: FastAPI):
@@ -40,9 +53,9 @@ def create_app(
             if live:
                 endpoint = f"ws://127.0.0.1:{live_gateway_port}/"
             else:
-                gateway = MockGateway(instrument, interval, disconnect_after)
+                gateway = MockGateway(instrument, interval, disconnect_after, mode=mode)
                 endpoint = await stack.enter_async_context(gateway.running())
-            collector = asyncio.create_task(Collector(endpoint, state, journal=journal).run())
+            collector = asyncio.create_task(Collector(endpoint, state, journal=journal, micro=micro).run())
             try:
                 yield
             finally:
@@ -54,6 +67,12 @@ def create_app(
         now = Observation.now()
         snapshot = state.snapshot(now) if full else {"status": state.status(now)}
         status = snapshot["status"]
+        status["market_data_mode"] = micro.mode
+        status["requested_market_data_mode"] = requested_mode
+        status["mbp_status"] = micro.depth.state if micro.depth else "DISABLED"
+        status["mbo_entitlement"] = micro.entitlement
+        if full:
+            snapshot["microstructure"] = micro.snapshot(now)
         status["recorder"] = {
             "enabled": journal is not None,
             "session_id": journal.session if journal else None,
