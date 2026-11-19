@@ -5,6 +5,7 @@ from datetime import datetime, timezone
 import json
 import platform
 import socket
+import time
 from pathlib import Path
 from urllib.request import HTTPRedirectHandler, ProxyHandler, build_opener
 
@@ -14,18 +15,42 @@ class NoRedirect(HTTPRedirectHandler):
         return None
 
 
-def diagnostic(status, gateway_reachable=None):
+def diagnostic(status, gateway_reachable=None, *, features=None, expiry_verified=False):
     quality = status["quality"]
     recorder = status["recorder"]
     depths = {"mbp": status["mbp_status"], "dbo": status["mbo_entitlement"]}
     live = status["mode"] == "LIVE"
+    features = features or {}
+    mbo = features.get("mbo", {}).get("counts") or {}
+    mbp = features.get("mbp", {})
+    receiver = status.get("receiver", {})
+    ready = status["market_data_mode"]
+    gate_a = (status["transport_connected"] and status["subscribe_ack"]
+              and status["request_id"] == status["last_ack_request_id"]
+              and status["trade_freshness"] == status["bbo_freshness"] == "OBSERVED")
+    gate_b = bool(gate_a and mbp.get("status") == "VALID_BOOK"
+                  and quality["last_mbp_snapshot"] and features.get("ofi", {}).get("status") == "VALID")
+    gate_c = bool(gate_b and status["mbo_entitlement"] in ("OPERATOR_REPORTED", "SYNTHETIC")
+                  and quality["last_valid_dbo"] and "mbo" not in quality["missing_sources"])
     ack = status["subscribe_ack"] and status["request_id"] == status["last_ack_request_id"]
     return {
         "schema_version": 1, "timestamp_utc": datetime.now(timezone.utc).isoformat(),
         "git_sha": status["software_revision"], "os": platform.system(), "python": platform.python_version(),
         "source": status["mode"], "effective_mode": status["market_data_mode"],
         "contract": {key: status[key] for key in ("exchange", "symbol", "expiry")},
-        "gateway_tcp_reachable": gateway_reachable, "matching_ack_observed": bool(ack),
+        "expiry_verification": "OPERATOR_ATTESTED" if live and expiry_verified else "UNVERIFIED",
+        "gateway_tcp_reachable": gateway_reachable,
+        "stream_readiness": {mode: "PASS" if passed else "UNVERIFIED"
+                             for mode, passed in zip("ABC", (gate_a, gate_b, gate_c), strict=True)},
+        "effective_stream_ready": {"A": gate_a, "B": gate_b, "C": gate_c}[ready],
+        "fill_events": {"exact": mbo.get("exact_fill", 0), "inferred": mbo.get("inferred_fill", 0)},
+        "recovery": {key: mbp.get(key) for key in ("status", "generation", "sequence", "counts")},
+        "receiver": {key: receiver.get(key) for key in (
+            "receive_queue_high_water", "receive_queue_capacity", "receive_pressure_count", "uncertain_received_frames",
+            "depthsnap_send_to_receipt_ms", "depthsnap_receipt_to_dispatch_ms", "depthsnap_receipt_to_publication_ms",
+        )},
+        "commit_latency_us": recorder.get("observation_to_commit_us"),
+        "publication_latency_us": features.get("diagnostics", {}).get("observation_to_availability_us"), "matching_ack_observed": bool(ack),
         "eligible_trade_count": status["counters"].get("eligible_trade", 0),
         "eligible_bbo_count": status["counters"].get("eligible_bbo", 0),
         "depth": depths,
@@ -53,9 +78,14 @@ def main():
     cli.add_argument("--port", type=int, default=8000)
     cli.add_argument("--gateway-port", type=int)
     cli.add_argument("--output", type=Path)
+    cli.add_argument("--require-mode", choices=("A", "B", "C"))
+    cli.add_argument("--wait-seconds", type=float, default=0)
+    cli.add_argument("--expiry-verified", action="store_true", help="record a local operator's expiry attestation")
     args = cli.parse_args()
     if any(port is not None and not 1 <= port <= 65535 for port in (args.port, args.gateway_port)):
         cli.error("Invalid IPv4 loopback port")
+    if not 0 <= args.wait_seconds <= 120:
+        cli.error("Readiness wait must be between 0 and 120 seconds")
     if args.gateway_port is not None and platform.system() != "Windows":
         cli.error("Vendor gateway TCP verification is Windows-only")
     reach = None
@@ -66,9 +96,25 @@ def main():
         except OSError:
             reach = False
     try:
-        with build_opener(ProxyHandler({}), NoRedirect()).open(f"http://127.0.0.1:{args.port}/api/status", timeout=5) as response:
-            status = json.loads(response.read(1_048_577))
-        report = diagnostic(status, reach)
+        opener = build_opener(ProxyHandler({}), NoRedirect())
+        deadline = time.monotonic() + args.wait_seconds
+        while True:
+            try:
+                with opener.open(f"http://127.0.0.1:{args.port}/api/snapshot", timeout=3) as response:
+                    snapshot = json.loads(response.read(16 * 1024 * 1024 + 1))
+                report = diagnostic(snapshot["status"], reach, features=snapshot["microstructure"],
+                                    expiry_verified=args.expiry_verified)
+                if args.require_mode is None or (
+                    report["effective_mode"] == args.require_mode and report["effective_stream_ready"]
+                ):
+                    break
+                if time.monotonic() >= deadline:
+                    report["gates"]["requested_mode_ready"] = "FAIL"
+                    break
+            except OSError:
+                if time.monotonic() >= deadline:
+                    raise
+            time.sleep(.1)
         rendered = json.dumps(report, indent=2) + "\n"
         if args.output:
             with local_path(args.output).open("x", encoding="utf-8") as output:

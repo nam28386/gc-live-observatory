@@ -12,6 +12,7 @@ from .books import parse_depth, parse_order
 from .events import Instrument, Observation, Trade, parse_event
 from .journal import Journal
 from .microstructure import Microstructure
+from .state import ObservatoryState
 
 
 def observation(fields):
@@ -79,6 +80,8 @@ def replay(path: Path, session: str, mode: str, limit: int, *, through_id=None, 
         engine = Microstructure(initial_mode, instrument, source["source"],
                                 source.get("stale_after_ns", 3_000_000_000))
         engine.capture_id = session
+        state = ObservatoryState(instrument)
+        wave_capture = source.get("measurement_schema_version", 0) >= 4
         for row in rows:
             if processed == limit:
                 break
@@ -94,8 +97,11 @@ def replay(path: Path, session: str, mode: str, limit: int, *, through_id=None, 
                     last = observation(clocks)
                     if kind == "ack":
                         engine.connect(last)
+                        state.on_connect(payload["request_id"])
+                        state.on_ack(last)
                     else:
                         engine.disconnect(last)
+                        state.on_disconnect(payload.get("reason", "gap"), last)
                         engine.last_time = last.monotonic_ns
             elif kind == "mbp_gap" and engine.depth and payload["reason"] in ("malformed_mbp", "snapshot_timeout"):
                 last = observation(payload["detected"])
@@ -122,7 +128,9 @@ def replay(path: Path, session: str, mode: str, limit: int, *, through_id=None, 
                     if isinstance(event, Trade):
                         if not event.conditional and (last_trade is None or event.exchange_time_ms >= last_trade):
                             last_trade = event.exchange_time_ms
-                            engine.trade(event)
+                            state.on_trade(event)
+                            engine.trade(event, candles=state.candles if wave_capture else None,
+                                         session=payload.get("market_session"))
                     else:
                         engine.quote(event)
                 elif kind == "mbo" and engine.orders:
@@ -131,6 +139,7 @@ def replay(path: Path, session: str, mode: str, limit: int, *, through_id=None, 
                     data = raw["result"] if kind == "depth_snapshot" else raw["data"]
                     engine.depth_event(parse_depth(data, last), snapshot=kind == "depth_snapshot")
             engine.durable_cards.clear()
+            engine.waves.durable.clear()
     finished = cursor == position
     if strict and not finished:
         raise ValueError("Replay limit truncated the requested capture prefix")

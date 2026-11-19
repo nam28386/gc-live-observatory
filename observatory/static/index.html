@@ -34,6 +34,24 @@
       <article class="chart" data-frame="H1"><header><h2>H1</h2><output>Awaiting trade</output></header><canvas aria-label="H1 candle chart"></canvas></article>
     </section>
 
+    <section class="microstructure" aria-label="Wave investigation">
+      <div class="micro-heading">
+        <h2>Intraday waves</h2><output id="wave-count"></output>
+      </div>
+      <div id="wave-hierarchy" class="analytic-grid" aria-label="Wave hierarchy"></div>
+      <details class="evidence">
+        <summary>Investigate a wave</summary>
+        <label for="wave-select">Observed wave</label>
+        <select id="wave-select"><option value="">Awaiting evidence</option></select>
+        <pre id="wave-card"></pre>
+      </details>
+      <details class="evidence">
+        <summary>Research review</summary>
+        <div id="research-status"></div>
+        <p id="research-population"></p>
+      </details>
+    </section>
+
     <section class="microstructure" aria-label="Microstructure measurements">
       <div class="micro-heading"><h2>Microstructure</h2><output id="depth-health"></output></div>
       <div class="analytic-grid">

@@ -48,6 +48,7 @@ class Collector:
         ack_timeout: float = 2.0,
         journal: Journal | None = None,
         micro: Microstructure | None = None,
+        session_calendar=None,
     ) -> None:
         endpoint = urlsplit(url)
         if (
@@ -60,6 +61,7 @@ class Collector:
         self.url = url
         self.journal = journal
         self.micro = micro
+        self.session_calendar = session_calendar
         self.state = state
         self.retry_delay = retry_delay
         self.ack_timeout = ack_timeout
@@ -70,6 +72,7 @@ class Collector:
         self.last_quality_sample_ns = None
         self.receive_high_water = 0
         self.receive_pressure = 0
+        self.uncertain_receipts = 0
         self.recovery_receipt_ms = None
         self.recovery_dispatch_ms = None
         self.recovery_publication_ms = None
@@ -157,6 +160,7 @@ class Collector:
         if capture_interrupted and self.journal and not self.state.recorder_error:
             await self.journal.append("gap", observed.utc_ns, {
                 "reason": reason, "request_id": self.state.request_id, "observed": observed.wire(),
+                "receiver_uncertain_min": self.uncertain_receipts,
             })
         if not self.state.recorder_error:
             await self.persist_cards(observed)
@@ -218,9 +222,11 @@ class Collector:
         # Socket receipt keeps progressing across recorder awaits. The consumer
         # still applies every frame in original wire order, including RPC images.
         queue = asyncio.Queue(RECEIVE_QUEUE)
+        admitted = 0
         loop = asyncio.get_running_loop()
 
         async def receiver():
+            nonlocal admitted
             terminal = None
             try:
                 while True:
@@ -230,17 +236,20 @@ class Collector:
                         self.receive_pressure += 1
                     async with asyncio.timeout(RECEIVE_PRESSURE_TIMEOUT):
                         await queue.put(frame)
+                    admitted += 1
                     self.receive_high_water = max(self.receive_high_water, queue.qsize())
             except TimeoutError:
+                self.uncertain_receipts += 1
                 terminal = SubscriptionFailure("local_receive_backpressure")
             except ConnectionClosed as exc:
                 if not exc.rcvd or exc.rcvd.code not in (1000, 1001):
                     terminal = exc
-            except OSError as exc:
+            except Exception as exc:
                 terminal = exc
             await queue.put(terminal)
 
         async def receive(deadline=None):
+            nonlocal admitted
             if not queue.empty():
                 item = queue.get_nowait()
             elif deadline is None:
@@ -250,6 +259,8 @@ class Collector:
                     item = await queue.get()
             if isinstance(item, Exception):
                 raise item
+            if isinstance(item, Received):
+                admitted -= 1
             return item
 
         reader = asyncio.create_task(receiver())
@@ -258,6 +269,7 @@ class Collector:
         finally:
             reader.cancel()
             await asyncio.gather(reader, return_exceptions=True)
+            self.uncertain_receipts += admitted
 
     async def consume_market(self, socket, receive):
         pending = None
@@ -352,7 +364,8 @@ class Collector:
             "incoming_frames": self.incoming_frames, "decoded_frames": self.decoded_frames,
             "ingest_high_water_frames": self.ingest_high_water_frames,
             "receive_queue_capacity": RECEIVE_QUEUE, "receive_queue_high_water": self.receive_high_water,
-            "receive_pressure_count": self.receive_pressure, "depthsnap_send_to_receipt_ms": self.recovery_receipt_ms,
+            "receive_pressure_count": self.receive_pressure, "uncertain_received_frames": self.uncertain_receipts,
+            "depthsnap_send_to_receipt_ms": self.recovery_receipt_ms,
             "depthsnap_receipt_to_dispatch_ms": self.recovery_dispatch_ms,
             "depthsnap_receipt_to_publication_ms": self.recovery_publication_ms,
         }
@@ -443,9 +456,12 @@ class Collector:
     async def persist_cards(self, observed):
         if self.micro:
             cards, self.micro.durable_cards = self.micro.durable_cards, []
+            waves, self.micro.waves.durable = self.micro.waves.durable, []
             if self.journal:
                 for card in cards:
                     await self.journal.append("evidence", observed.utc_ns, {"event_schema_version": 2, **card})
+                for wave in waves:
+                    await self.journal.append("wave_transition", observed.utc_ns, wave)
 
     def decode(self, frame: str | bytes, *, track=True, observed=None) -> tuple[dict, Observation, str] | None:
         observed = observed or Observation.now()
@@ -524,6 +540,10 @@ class Collector:
             ):
                 await self.reject("future_trade_time", observed)
                 return
+            session = None
+            if self.session_calendar and self.state.live and isinstance(event, Trade):
+                session_state, session_id = self.session_calendar.at(observed.utc_ns)
+                session = session_id if session_id else ("CLOSED" if session_state == "CLOSED" else None)
             if self.journal:
                 trade = isinstance(event, Trade)
                 if trade:
@@ -542,12 +562,12 @@ class Collector:
                         "request_id": self.state.request_id,
                     }
                 await self.journal.append("trade" if trade else "bbo", observed.utc_ns, {
-                    "event": event.wire(), "raw": frame, "request_id": self.state.request_id,
+                    "event": event.wire(), "raw": frame, "request_id": self.state.request_id, "market_session": session,
                 }, coverage=coverage)
             if isinstance(event, Trade):
                 self.state.on_trade(event)
                 if self.micro and self.state.last_trade is event:
-                    self.micro.trade(event)
+                    self.micro.trade(event, candles=self.state.candles, session=session)
             else:
                 self.state.on_ticker(event)
                 if self.micro:

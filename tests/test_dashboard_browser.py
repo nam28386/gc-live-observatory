@@ -80,8 +80,11 @@ def test_every_canvas_updates_from_mock_websocket_and_gap_is_visible(app_url, mo
             expect(page.locator("#micro-mbo")).to_contain_text("SYNTHETIC")
             expect(page.locator("#timeline-entries")).to_contain_text("MBP snapshot recovered")
             expect(page.locator("#micro-ofi")).to_contain_text("VALID")
-            page.get_by_text("Evidence cards", exact=False).click()
+            page.locator("summary").filter(has_text="Evidence cards").click()
             expect(page.locator("#evidence-card")).to_contain_text("MEASUREMENT")
+            expect(page.get_by_label("Wave hierarchy")).to_contain_text("M15")
+            page.get_by_text("Investigate a wave", exact=True).click()
+            expect(page.locator("#wave-card")).to_contain_text("EXPECTED_RESPONSE_UNAVAILABLE")
         else:
             expect(page.locator("#micro-mbo")).to_have_text("DISABLED · DISABLED")
         canvases = page.locator("canvas")

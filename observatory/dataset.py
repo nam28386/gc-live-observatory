@@ -10,7 +10,7 @@ from .replay import canonical, capture_prefix
 from .web import software_revision
 
 SECOND = 10**9
-FEATURE_VERSION = "hgc001-receive-time-v3"
+FEATURE_VERSION = "hgc001-receive-time-v4"
 PRIMARY_METRIC = "paired holdout mean squared error difference (baseline minus augmented), impact_ticks squared"
 MAX_RECORDS = 1_000_000
 MAX_POPULATION = 100_000
@@ -38,7 +38,7 @@ def eligible(card):
     return None
 
 
-def build_dataset(path, sessions):
+def build_dataset(path, sessions, *, ledger=None):
     from hashlib import sha256
 
     population = []
@@ -63,6 +63,11 @@ def build_dataset(path, sessions):
                              "source": provenance.get("source"), "producer_revision": provenance.get("software_revision")})
         for card in latest.values():
             reason = eligible(card)
+            if card.get("capture_session") not in (None, session):
+                reason = "capture_session_mismatch"
+            if ledger is not None:
+                ledger.append({"event_id": card["id"], "capture_session": session, "through_id": position,
+                               "status": card["status"], "exclusion": reason, "phase": card["phase"]})
             if reason:
                 exclusions[reason] += 1
                 continue
@@ -77,9 +82,15 @@ def build_dataset(path, sessions):
                 "t0_utc_ns": str(utc), "t0_receive_ns": card["start"]["monotonic_ns"],
                 "coverage": "eligible_observed_mbp_and_bbo", "missing": card.get("missing_evidence", []),
                 "feature_record_available_receive_ns": prediction["available_receive_ns"],
+                "feature_materialized_receive_ns": prediction["available_receive_ns"],
+                "consumer_visible_receive_ns": None,
+                "availability_status": ("AFTER_CUTOFF" if
+                    int(prediction["available_receive_ns"]) > int(prediction["cutoff_receive_ns"])
+                    else "PUBLICATION_TIME_UNATTESTED"),
+                "online_available_at_cutoff": False,
                 "cutoff_receive_ns": prediction["cutoff_receive_ns"], "label": label,
                 "baseline": {"signed_contracts_1s": card["signed_contracts_1s"], "spread_ticks": card["pre_spread_ticks"],
-                             "fixed_pre_depth": card["pre_depth"], "utc_hour": card["utc_hour"],
+                             "fixed_pre_depth": card["pre_depth"], "pre_mid_ticks": card["pre_mid_ticks"], "utc_hour": card["utc_hour"],
                              "market_session": card.get("market_session", "UNKNOWN"), "impact_at_cutoff_ticks": prediction["impact_ticks"]},
                 "added_refill_contracts": prediction["refill_contracts"],
                 "negative_control_refill_contracts": prediction["opposite_refill_contracts"],
@@ -93,13 +104,18 @@ def build_dataset(path, sessions):
     holdout = groups[-1] if len(groups) >= 2 else None
     boundary = min((int(item["t0_utc_ns"]) for item in population if item["capture_session"] == holdout), default=None)
     result = []
+    ledger_index = {(row["capture_session"], row["event_id"]): row for row in ledger or ()}
     for item in population:
         if not holdout:
             item["split"] = "unassigned_one_group"
         elif item["capture_session"] == holdout:
             item["split"] = "holdout"
         elif int(item["t0_utc_ns"]) + 60 * SECOND >= boundary:
-            exclusions["overlap_or_30s_embargo"] += 1
+            reason = "overlap_or_30s_embargo"
+            exclusions[reason] += 1
+            key = item["capture_session"], item["event_id"]
+            if key in ledger_index:
+                ledger_index[key]["exclusion"] = reason
             continue
         else:
             item["split"] = "exploration"
@@ -134,10 +150,15 @@ def main():
     args = cli.parse_args()
     try:
         directory = local_path(args.output_directory)
-        rows, manifest = build_dataset(args.database, args.session)
+        ledger = []
+        rows, manifest = build_dataset(args.database, args.session, ledger=ledger)
+        manifest["population_ledger_rows"] = len(ledger)
         directory.mkdir()
         with (directory / "dataset.jsonl").open("x", encoding="utf-8", newline="\n") as output:
             for row in rows:
+                output.write(canonical(row) + "\n")
+        with (directory / "population.jsonl").open("x", encoding="utf-8", newline="\n") as output:
+            for row in ledger:
                 output.write(canonical(row) + "\n")
         (directory / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
     except (OSError, ValueError, sqlite3.Error) as exc:

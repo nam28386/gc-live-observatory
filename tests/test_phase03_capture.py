@@ -199,7 +199,8 @@ def test_hgc001_dataset_excludes_future_invalid_and_overlap(tmp_path):
         fixture_card("leak", now, late=True), fixture_card("gap", now, invalid=True),
     ]))
     last = asyncio.run(record([fixture_card("holdout", now + 120 * 10**9)]))
-    rows, manifest = build_dataset(path, [first, last])
+    ledger = []
+    rows, manifest = build_dataset(path, [first, last], ledger=ledger)
     assert [(row["event_id"], row["split"]) for row in rows] == [("explore", "exploration"), ("holdout", "holdout")]
     assert manifest["scientific_status"] == "UNRESOLVED"
     assert len(manifest["capture_prefixes"]) == 2
@@ -207,6 +208,12 @@ def test_hgc001_dataset_excludes_future_invalid_and_overlap(tmp_path):
                                       "overlap_or_30s_embargo": 1}
     assert rows[0]["baseline"]["impact_at_cutoff_ticks"] == 1
     assert rows[0]["negative_control_refill_contracts"] == 2
+    assert rows[0]["baseline"]["pre_mid_ticks"] == 27500
+    assert rows[0]["availability_status"] == "AFTER_CUTOFF"
+    assert rows[0]["online_available_at_cutoff"] is False
+    assert rows[0]["consumer_visible_receive_ns"] is None
+    assert len(ledger) == 5
+    assert {item["event_id"] for item in ledger if item["exclusion"]} == {"gap", "leak", "overlaps"}
 
 
 def test_sanitized_diagnostic_has_no_quotes_events_or_connector_secrets():

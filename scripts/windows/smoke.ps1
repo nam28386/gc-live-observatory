@@ -4,7 +4,7 @@ param(
     [int]$GatewayPort = 9001,
     [int]$Port = 8000,
     [ValidateSet("A", "B", "C")][string]$Mode = "A",
-    [int]$TimeoutSeconds = 45
+    [ValidateRange(1,120)][int]$TimeoutSeconds = 45
 )
 $ErrorActionPreference = 'Stop'
 & (Join-Path $PSScriptRoot 'preflight.ps1') -GatewayPort $GatewayPort -Port $Port -Running
@@ -25,9 +25,10 @@ do {
         $s.trade_freshness -eq 'OBSERVED' -and $s.bbo_freshness -eq 'OBSERVED' -and
         $data.trade -and !$data.trade.conditional -and $data.bbo -and $data.bbo.spread_ticks -ge 0 -and
         $s.quote_timestamp_basis -eq 'collector_observation' -and
-        [long]$s.last_eligible_trade.utc_ns -gt [long]$initial.status.last_eligible_trade.utc_ns -and
-        [long]$s.last_bbo_message.utc_ns -gt [long]$initial.status.last_bbo_message.utc_ns) {
+        [long]$s.counters.eligible_trade -gt [long]$initial.status.counters.eligible_trade -and
+        [long]$s.counters.eligible_bbo -gt [long]$initial.status.counters.eligible_bbo) {
         if ($Mode -ne "A" -and ($data.microstructure.liquidity.status -ne "VALID" -or
+            $data.microstructure.ofi.status -ne "VALID" -or
             ($data.microstructure.mbp.generation -eq $initial.microstructure.mbp.generation -and
              $data.microstructure.mbp.sequence -le $initial.microstructure.mbp.sequence))) {
             Start-Sleep -Milliseconds 300

@@ -116,12 +116,18 @@ def run(args, path, **options):
     with closing(sqlite3.connect(path)) as db:
         durable = dict(db.execute("SELECT kind,count(*) FROM records GROUP BY kind"))
     assert dict(source.sent) == {kind: durable[kind] for kind in source.sent}
+    replay_start = time.perf_counter()
     reprocessed = replay(path, session, args.mode, 1_000_000)
+    replay_elapsed = time.perf_counter() - replay_start
     result = {
         "sent": dict(source.sent), "processed_stream_frames": count, "decoded_total_frames": status["receiver"]["decoded_frames"],
         "durable": durable, "durable_gap_records": durable.get("mbp_gap", 0) + durable.get("gap", 0),
         "recovery_replies": source.recovery_replies, "planned_connections": connections,
         "replay_records": reprocessed["records_processed"],
+        "replay_records_per_second": round(reprocessed["records_processed"] / replay_elapsed),
+        "wave_transitions_committed": durable.get("wave_transition", 0),
+        "wave_transitions_per_second": round(durable.get("wave_transition", 0) / elapsed, 2),
+        "receiver": status["receiver"],
         "incoming_frames_per_second": round(expected / (source.send_ended - source.send_started)),
         "durable_market_events_per_second": round(expected / elapsed),
         "api_completion_seconds": round(elapsed, 3), "cpu_seconds": round(time.process_time() - cpu_start, 3),

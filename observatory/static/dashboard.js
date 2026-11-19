@@ -110,6 +110,13 @@ function draw(panel, bars, tickSize) {
     ctx.arc(x, chartTop + 3, 3, 0, 2 * Math.PI);
     ctx.fill();
   }
+  for (const wave of waveRows) {
+    const sourceTime = wave.trade_exchange_ms;
+    if (wave.timeframe !== frame || !(sourceTime >= first && sourceTime < last.end_ms)) continue;
+    const x = left + (sourceTime - first) / duration * step;
+    ctx.fillStyle = wave.direction === "UP" ? "#79d4b1" : "#ef988b";
+    ctx.fillRect(x - 2, chartTop + 9, 4, 4);
+  }
   if (cursorTime !== null && cursorTime >= first && cursorTime < last.end_ms) {
     const x = left + (cursorTime - first) / duration * step;
     ctx.strokeStyle = "#9ca9ab";
@@ -174,6 +181,7 @@ function update(snapshot) {
   show("gaps", count + (openGap ? " · open gap" : count ? " · historical gaps retained" : ""));
   document.getElementById("gaps").classList.toggle("warning", count > 0);
   renderMicrostructure(snapshot.microstructure);
+  renderWaves(snapshot.microstructure);
   for (const panel of panels) draw(panel, snapshot.candles[panel.dataset.frame], tickSize);
 }
 
@@ -250,7 +258,9 @@ function renderMicrostructure(micro) {
 function showEvidence() {
   const id = document.getElementById("evidence-select").value;
   const card = cards.find(item => item.id === id);
-  show("evidence-card", card ? JSON.stringify(card, null, 2) : "");
+  show("evidence-card", card ? JSON.stringify({
+    ...card, expected_response: {status: "EXPECTED_RESPONSE_UNAVAILABLE"}, residual: null
+  }, null, 2) : "");
 }
 
 document.getElementById("evidence-select").addEventListener("change", showEvidence);
@@ -269,6 +279,64 @@ for (const panel of panels) {
     if (currentSnapshot) update(currentSnapshot);
   });
 }
+
+const waveSelect = document.getElementById("wave-select");
+let waveRows = [];
+let waveFetchId = 0;
+
+function renderWaves(view) {
+  waveRows = view.waves || [];
+  show("wave-count", waveRows.length + " observed");
+  const hierarchy = document.getElementById("wave-hierarchy");
+  const active = ["H1", "M15", "M5", "M1"].map(frame => {
+    const wave = [...waveRows].reverse().find(item => item.timeframe === frame);
+    return frame + " · " + (wave ? wave.state.replaceAll("_", " ").toLowerCase() : "awaiting observation");
+  });
+  const viewKey = active.join("|");
+  if (hierarchy.dataset.version !== viewKey) {
+    hierarchy.dataset.version = viewKey;
+    hierarchy.replaceChildren(...active.map(text => {
+      const article = document.createElement("article");
+      article.textContent = text;
+      return article;
+    }));
+  }
+  const ids = waveRows.map(row => row.wave_id).join(",");
+  if (waveSelect.dataset.ids !== ids) {
+    const selected = waveSelect.value;
+    waveSelect.dataset.ids = ids;
+    waveSelect.replaceChildren(...(waveRows.length ? [...waveRows].reverse().map(row =>
+      new Option(row.timeframe + " · " + row.direction + " · " + received(row.start), row.wave_id)
+    ) : [new Option("Awaiting evidence", "")]));
+    if (waveRows.some(row => row.wave_id === selected)) waveSelect.value = selected;
+    if (waveSelect.closest("details").open) showWave();
+  }
+  show("research-status", "H-GC-001 · UNRESOLVED · no empirical reference loaded");
+  show("research-population", view.evidence.length + " recent evidence cards · " +
+       view.evidence.filter(card => card.label != null).length + " with eligible observed outcomes");
+}
+
+async function showWave() {
+  const selected = waveSelect.value;
+  const request = ++waveFetchId;
+  if (!selected) { show("wave-card", "Awaiting an observed wave"); return; }
+  try {
+    const response = await fetch("/api/research", {cache: "no-store"});
+    if (!response.ok) throw new Error("Research view unavailable");
+    const data = await response.json();
+    if (request !== waveFetchId) return;
+    const wave = data.wave_objects.find(item => item.wave_id === selected);
+    show("wave-card", wave ? JSON.stringify(wave, null, 2) : "Observation outside the retained view");
+    show("research-status", data.hypothesis + " · " + data.scientific_status + " · " + data.empirical_evaluation);
+  } catch {
+    if (request === waveFetchId) show("wave-card", "Research view unavailable");
+  }
+}
+
+waveSelect.addEventListener("change", showWave);
+waveSelect.closest("details").addEventListener("toggle", () => {
+  if (waveSelect.closest("details").open) showWave();
+});
 
 function connect() {
   const protocol = location.protocol === "https:" ? "wss:" : "ws:";

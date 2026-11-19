@@ -7,6 +7,8 @@ from hashlib import sha256
 from .books import DepthBook, OrderBook
 from .events import BookTicker, Observation, Trade
 
+from .waves import Waves
+
 SECOND = 10**9
 WINDOW = 2 * SECOND
 LIMIT = 8192
@@ -96,6 +98,7 @@ class Microstructure:
         self.invalid_windows = 0
         self.processing_ns = deque(maxlen=4096)
         self.availability_ns = deque(maxlen=4096)
+        self.waves = Waves(instrument, source)
 
     def connect(self, observed):
         self.transport = True
@@ -103,6 +106,7 @@ class Microstructure:
         self.flow_coverage_since = observed.monotonic_ns
 
     def disconnect(self, observed):
+        self.waves.invalidate(observed, "Transport continuity interrupted")
         self.transport = False
         self.mid = self.bbo = self.last_trade_seen = None
         self.events.clear()
@@ -131,6 +135,8 @@ class Microstructure:
         if self.last_time is not None and stamp < self.last_time:
             return False
         self.last_time = stamp
+        if self.waves.active and self.mid and stamp - self.mid[0] > self.freshness_ns:
+            self.waves.invalidate(observed, "BBO was stale at the next observation")
         if not self.samples or stamp - self.samples[-1][0] >= SECOND // 10:
             self.append("samples", (stamp, self.depth_eligible(stamp)))
         if self.last_intensity_check is None or stamp - self.last_intensity_check >= SECOND // 4:
@@ -218,7 +224,7 @@ class Microstructure:
                 self.detect("high_flow_weak_mid_response", observed, facts)
 
 
-    def trade(self, event: Trade):
+    def trade(self, event: Trade, *, candles=None, session=None):
         if not self.advance(event.observed):
             return
         stamp = event.observed.monotonic_ns
@@ -227,10 +233,21 @@ class Microstructure:
         self.append("events", (stamp, "trade"))
         self.append("flow", (stamp, event.signed_size, event.size, event.price_ticks))
         signed = sum(row[1] for row in self.flow if row[0] >= stamp - SECOND)
+        self.waves.flow = signed
+        if candles is not None:
+            self.waves.trade_context(event.observed, candles, session)
         if abs(signed) >= BURST_CONTRACTS and (not self.active or self.active.terminal) and (
             stamp >= self.saturated_until.get("flow", stamp)
         ):
             self.start_candidate(event, signed)
+            if candles is not None:
+                self.active.card["market_session"] = session or "UNKNOWN"
+                self.durable_cards[-1]["market_session"] = session or "UNKNOWN"
+                self.waves.start(self.active.card, event.observed, candles, session)
+                link = [wave.header["wave_id"] for wave in self.waves.active.values()
+                        if self.active.card["id"] in wave.header["event_ids"]]
+                self.active.card["wave_ids"] = link
+                self.durable_cards[-1]["wave_ids"] = link
 
     def start_candidate(self, event, signed):
         stamp = event.observed.monotonic_ns
@@ -271,6 +288,7 @@ class Microstructure:
             return
         if event.quote.quality_flag:
             self.mid = self.bbo = None
+            self.waves.invalidate(event.observed, "Invalid BBO")
             if self.active and not self.active.terminal:
                 self.finish_invalid(event.observed, "invalid BBO within event window")
             return
@@ -285,12 +303,34 @@ class Microstructure:
                             {"prior_mid_ticks": previous[1], "mid_change_ticks": self.mid[1] - previous[1],
                              "net_contracts_1s": signed})
         self.bbo = stamp, bid, ask
+        if self.waves.active:
+            self.waves.quote(event.observed, self.mid[1], ask - bid, lambda: self.wave_inputs(stamp))
         c = self.active
         if c and not c.terminal:
             if stamp <= c.start + WINDOW:
                 c.mid2 = self.mid
             if stamp <= c.start + 30 * SECOND:
                 c.mid30 = self.mid
+
+    def wave_inputs(self, stamp):
+        flow_valid = stamp >= self.saturated_until.get("flow", stamp)
+        depth_valid = self.depth_eligible(stamp)
+        ofi_valid = depth_valid and self.depth_coverage_since is not None and (
+            stamp - self.depth_coverage_since >= WINDOW and stamp >= self.saturated_until.get("ofi", stamp)
+        )
+        events_valid = stamp >= self.saturated_until.get("events", stamp)
+        return {
+            "valid_mbp": depth_valid,
+            "visible_depth_by_side_contracts": (
+                [sum(level[1] for level in levels) for levels in self.depth.top()] if depth_valid else None
+            ),
+            "best_level_ofi_2s": sum(row[1][0] for row in self.ofi if row[0] >= stamp - WINDOW) if ofi_valid else None,
+            "observed_event_intensity_2s": (
+                sum(row[0] >= stamp - WINDOW for row in self.events) / 2 if events_valid else None
+            ),
+            "flow_window_valid": flow_valid,
+            "hgc_prediction": self.active.card.get("prediction") if self.active and not self.active.invalid else None,
+        }
 
     def depth_eligible(self, timestamp):
         if not self.depth or not self.depth.valid or self.depth.last is None:
@@ -316,6 +356,7 @@ class Microstructure:
             self.finish_invalid(event.observed, "MBP continuity interrupted")
         if not self.advance(event.observed):
             self.depth.invalidate("late_receive_clock", event.observed)
+            # A delayed observation cannot revise an earlier wave state.
             return
         before_eligible = self.depth_eligible(event.observed.monotonic_ns)
         if not before_eligible:
@@ -326,6 +367,7 @@ class Microstructure:
         stamp = event.observed.monotonic_ns
         eligible = self.depth_eligible(stamp)
         if not eligible or prior_epoch != self.depth.epoch:
+            self.waves.invalidate(event.observed, "MBP continuity or availability interrupted")
             self.ofi.clear()
             self.depth_coverage_since = None
             if self.active and not self.active.terminal:
@@ -465,4 +507,5 @@ class Microstructure:
             "intensity": {"status": "VALID" if flow_full and stamp >= self.saturated_until.get("events", stamp) else "PARTIAL",
                           "rates_per_second": {key: count / 2 for key, count in counts.items()}},
             "evidence": list(self.cards)[-8:],
+            "waves": self.waves.view(), "wave_transition_count": self.waves.transitions,
         }

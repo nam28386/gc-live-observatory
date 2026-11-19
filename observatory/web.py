@@ -17,6 +17,7 @@ from .journal import Journal, JournalError
 from .microstructure import Microstructure
 from .mock_gateway import MockGateway
 from .state import ObservatoryState
+from .waves import research_event, research_object
 from .quality import SessionCalendar, registry, summarize
 
 STATIC = Path(__file__).with_name("static")
@@ -55,7 +56,7 @@ def create_app(
     journal = Journal(capture_path, {
         "source": state.source, "exchange": instrument.exchange,
         "symbol": instrument.symbol, "expiry": instrument.expiry,
-        "measurement_schema_version": 3, "stale_after_ns": state.stale_after_ns,
+        "measurement_schema_version": 4, "stale_after_ns": state.stale_after_ns,
         "software_revision": software_revision(), "instrument_registry": instrument_registry,
         "timestamp_contract": "utc_ns and process monotonic_ns; source clocks per instrument contract",
         "capture_config": {"mode": mode, "batch_size": batch_size, "durability": "SQLite WAL FULL",
@@ -81,7 +82,7 @@ def create_app(
             else:
                 gateway = mock_gateway or MockGateway(instrument, interval, disconnect_after, mode=mode)
                 endpoint = await stack.enter_async_context(gateway.running())
-            app.state.collector = Collector(endpoint, state, journal=journal, micro=micro)
+            app.state.collector = Collector(endpoint, state, journal=journal, micro=micro, session_calendar=calendar)
             collector = asyncio.create_task(app.state.collector.run())
             try:
                 yield
@@ -164,6 +165,21 @@ def create_app(
     @app.get("/api/snapshot")
     async def snapshot():
         return await current_snapshot(full=True)
+
+    @app.get("/api/research")
+    async def research():
+        view = (await current_snapshot(full=True))["microstructure"]
+        objects = [research_object(wave, view["evidence"]) for wave in view["waves"]]
+        return {
+            "hypothesis": "H-GC-001", "scientific_status": "UNRESOLVED",
+            "empirical_evaluation": "NOT_RUN_INSUFFICIENT_DATA",
+            "wave_objects": objects,
+            "event_objects": [research_event(event) for event in view["evidence"]],
+            "population_scope": "retained window only",
+            "excluded_observed_candidates": sum(card.get("status") == "INELIGIBLE" for card in view["evidence"]),
+            "eligible_observed_candidates": sum(card.get("label") is not None for card in view["evidence"]),
+            "coverage": "bounded current observations, no empirical reference loaded",
+        }
 
     @app.get("/api/history")
     async def history(after: int = Query(0, ge=0, le=2**63 - 1),
