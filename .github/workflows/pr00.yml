@@ -102,6 +102,11 @@ jobs:
               $stress.sha -ne $env:GITHUB_SHA -or $stress.restart_pairs -ne 4) {
             throw 'Release evidence identity or repeat count mismatch'
           }
+          Write-Output "::notice title=Windows inner source ZIP::$($release.file) | $($release.bytes) bytes | SHA256 $($release.sha256)"
+          foreach ($workload in @('burst-b', 'mixed-c')) {
+            $row = Get-Content (Join-Path $build "synthetic-windows-$workload.json") -Raw | ConvertFrom-Json
+            Write-Output "::notice title=Windows synthetic $workload::$($row.processed_stream_frames) frames | $($row.durable_market_events_per_second) durable frames/s | $($row.replay_records_per_second) replay records/s | $($row.receiver.uncertain_received_frames) uncertain"
+          }
           @(
             '## Windows source RC'
             "- Commit: $($release.source_sha)"

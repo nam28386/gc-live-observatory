@@ -201,3 +201,63 @@ history and checks an exact-SHA allowlist when building and verifying the
 inner ZIP. This scan cannot cover unreachable history, external copies or
 arbitrary disguised data. The upload step enumerates the source ZIP,
 checksum, build metadata and synthetic operational summaries explicitly.
+
+## Biên bản nghiệm thu từng pilot
+
+Dùng đúng bản ZIP nguồn bên trong Actions wrapper và hai SHA256 do GitHub
+công bố cho đúng commit. Kiểm tra wrapper trước khi giải nén, sau đó kiểm tra
+ZIP nguồn với sidecar. Có thể so sánh bằng
+`(Get-FileHash -Algorithm SHA256 -LiteralPath $Zip).Hash.ToLowerInvariant()`.
+Giải nén ZIP nguồn vào thư mục có quyền ghi, đọc `source_sha` trong
+`RELEASE.json`, cài uv và chạy `install.ps1` để cài Python 3.12 cùng
+dependencies theo lockfile. Chạy synthetic acceptance với
+`--expected-sha $Sha` trước khi bật LIVE.
+
+Tạo mã riêng cho mỗi lượt A, B hoặc C. Với recorder tắt, chạy smoke để lưu
+diagnostic rồi dừng. Với recorder bật, hoàn tất lấy mẫu tài nguyên trong khi
+đang ghi, sau đó lưu diagnostic và checkpoint từ cùng một snapshot trước
+khi dừng. Giữ các đường dẫn dưới thư mục cục bộ ngoài Git và sử dụng tệp
+mới cho mỗi lượt.
+
+```powershell
+$PilotId = [Guid]::NewGuid().ToString('N')
+# Chỉ cho lượt LIVE đang capture và đã xác nhận quyền.
+.\scripts\windows\measure-pilot.ps1 -Seconds 30 | Set-Content -Encoding utf8 $Resources
+uv run --locked python -m observatory.diagnose --port 8000 --gateway-port 9001 --require-mode $Mode --output $Diagnostic --checkpoint-output $Checkpoint
+.\scripts\windows\stop.ps1
+# $Session và durable_position lấy từ diagnostic. Đọc prefix cục bộ.
+uv run --locked python -m observatory.evidence build $Session $Database --diagnostic $Diagnostic --checkpoint $Checkpoint --output $Packet
+uv run --locked python -m observatory.evidence verify $Packet $Database --diagnostic $Diagnostic --checkpoint $Checkpoint
+```
+
+Dựng biên bản từ diagnostic và checksum ZIP nguồn đã đối chiếu với bản
+phát hành. Chỉ thêm `--operator-authorized` khi người vận hành đã xác nhận
+quyền chạy pilot trên workstation. Thêm bộ tham số capture bên dưới chỉ khi
+đã thu được bằng chứng tương ứng. Với lượt không capture, dùng nguyên mảng
+`$PilotArgs` đầu tiên. Nếu phải kiểm tra lại biên bản, dùng cùng đầu vào với
+`--verify`.
+
+```powershell
+$PilotArgs = @('--pilot-id', $PilotId, '--artifact', $Zip, '--artifact-sha256', $SourceZipSha256, '--diagnostic', $Diagnostic, '--operator-authorized')
+# Chỉ thêm khi có capture được cấp quyền.
+$PilotArgs += @('--capture-packet', $Packet, '--database', $Database, '--checkpoint', $Checkpoint, '--resources', $Resources)
+uv run --locked python -m observatory.pilot @PilotArgs --output $PilotReport
+uv run --locked python -m observatory.pilot @PilotArgs --verify $PilotReport
+```
+
+Biên bản `gc-observatory-field-pilot` v1 chỉ xuất trường allowlist. Diagnostic
+và capture packet giữ nguyên schema. `PASS` trong biên bản có phạm vi
+`SYSTEM_OBSERVED` hoặc `SYNTHETIC_TESTED`. Mốc UTC của phiên và các độ trễ
+đo bằng monotonic clock được giữ theo nguồn đo. Báo cáo sampler là một cửa
+sổ trong phiên, gồm CPU-seconds của process, working set cao nhất trong các
+mẫu và kích thước tệp trước/sau. Các số này không đại diện cho disk IOPS
+hay throughput toàn sàn. Khi B qua nhưng C không khả dụng, giữ riêng biên
+bản B và kết quả C.
+
+Xác minh độc lập cần người được cấp quyền đối chiếu package, workstation,
+entitlement và bằng chứng cục bộ. Không gửi DB, private checkpoint, raw
+payload hoặc giá. Tách riêng quyền phân phối source, quyền truy cập API,
+và quyền giữ/nghiên cứu/chia sẻ dữ liệu CME/COMEX cùng dữ liệu dẫn xuất.
+Mỗi quyền chưa có nguồn xác nhận giữ `UNKNOWN`. Phiên bản dependency được
+ghim trong `uv.lock`; điều khoản của từng dependency theo metadata của gói
+cài đặt. Chủ sở hữu cần quyết định giấy phép source của repository.

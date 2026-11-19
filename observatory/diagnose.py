@@ -88,7 +88,8 @@ def diagnostic(status, gateway_reachable=None, *, features=None, expiry_verified
                                                         "backlog_records", "high_water_records", "failures", "session_id",
                                                         "durable_position", "storage_status")},
         "quality": {key: quality[key] for key in ("session_state", "market_observation_state", "transport_gap_count",
-                                                  "mbp_recovery_count", "invalid_feature_windows", "missing_sources")},
+                                                  "mbp_recovery_count", "invalid_feature_windows", "missing_sources",
+                                                  "elapsed_seconds")},
         "gates": {
             "gateway_tcp": "UNVERIFIED" if gateway_reachable is None else "PASS" if gateway_reachable else "FAIL",
             "subscribe_ack": "PASS" if ack else "FAIL",

@@ -12,6 +12,7 @@ from observatory.diagnose import diagnostic
 from observatory.evidence import build_packet, verify_packet
 from observatory.events import MOCK_GC
 from observatory.mock_gateway import MockGateway
+from observatory.pilot import build_report
 from observatory.web import create_app
 
 
@@ -50,6 +51,13 @@ def test_sanitized_attested_evidence_packet_on_real_socket(tmp_path):
         assert packet["field_gates"] == {gate: "UNVERIFIED" for gate in
                                          ("real_gateway", "real_depth_entitlement", "real_capture")}
         assert verify_packet(packet, database, diagnostic=diag, checkpoint=snapshot)["checkpoint_parity"] == "PASS"
+        field = build_report(diag, "a" * 32, diag["git_sha"], "b" * 64, authorized=True,
+                             packet=packet, database=database, checkpoint=snapshot)
+        assert field["replay_verification"]["checkpoint_parity"] == "PASS"
+        assert field["pilot_result_scope"] == "SYNTHETIC_TESTED"
+        assert field["independent_field_verification"] == "UNVERIFIED"
+        assert field["capture_rights_status"] == "NOT_APPLICABLE"
+        assert "do not export" not in json.dumps(field)
         serialized = json.dumps(packet)
         assert "price_ticks" not in serialized and "do not export" not in serialized
 
