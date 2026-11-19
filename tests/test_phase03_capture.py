@@ -268,3 +268,77 @@ def test_legacy_capture_can_be_inspected_but_is_not_attested(tmp_path):
     with pytest.raises(ValueError, match="unattested"):
         with capture_prefix(path, journal.session, strict=True):
             pass
+
+
+def test_hgc_live_and_replay_agree_after_virtual_cutoff_and_outcome(tmp_path, monkeypatch):
+    from observatory.collector import Collector
+    from observatory.events import MOCK_GC, Observation
+    from observatory.mock_gateway import MockGateway
+
+    # The real socket carries deterministic receive-clock offsets solely in this
+    # fixture. Production collector observation and source clocks remain distinct.
+    origin = time.monotonic_ns() - 50 * 10**9
+    origin_utc = time.time_ns() - 50 * 10**9
+    decode = Collector.decode
+
+    def fixture_decode(self, frame, *, track=True):
+        result = decode(self, frame, track=track)
+        if result is None:
+            return None
+        payload, stamp, raw = result
+        offset = payload.get("fixture_receive_ns", 0)
+        stamp = Observation(origin_utc + offset, origin + offset)
+        if track:
+            self.state.last_any = stamp
+        return payload, stamp, raw
+
+    monkeypatch.setattr(Collector, "decode", fixture_decode)
+
+    class CandidateTape(MockGateway):
+        async def publish(self, socket):
+            async def emit(channel, seconds, data):
+                await socket.send(json.dumps({
+                    "stream": f"comex.gcz6@{channel}", "data": data,
+                    "fixture_receive_ns": int(seconds * 1e9),
+                }))
+
+            async def book(seconds, sequence, quantity):
+                await emit("depthraw", seconds, {"type": "Update", "gen": 1, "seq": sequence,
+                                                "side": "S", "p": 2750.1, "q": quantity, "n": 1})
+
+            async def quote(seconds, bid, ask):
+                await emit("bookTicker", seconds, {"s": "GCZ6", "b": bid, "B": 8, "a": ask, "A": 8})
+
+            await emit("depthraw", 0, {"type": "Reset", "gen": 1})
+            await emit("depthraw", 0, {"type": "Image", "gen": 1, "seq": 0,
+                                     "rows": [[0, 2749.9, 10, 1], [1, 2750.1, 10, 1]]})
+            await quote(.5, 2749.9, 2750.1)
+            await emit("trade", 1, {**self.trade(0), "q": 12, "side": "B"})
+            await book(1.2, 1, 3)
+            await book(1.8, 2, 8)
+            await quote(2.9, 2750, 2750.2)
+            await quote(3.1, 2752, 2752.2)
+            await quote(30.9, 2751, 2751.2)
+            await quote(31.1, 2760, 2760.2)
+            await socket.wait_closed()
+
+    path = tmp_path / "hgc-parity.sqlite"
+    app = create_app(mode="B", stale_after=40, capture_path=path, batch_size=1,
+                     mock_gateway=CandidateTape(MOCK_GC, mode="B"))
+    with TestClient(app) as client:
+        deadline = time.monotonic() + 8
+        while True:
+            live = client.get("/api/snapshot").json()
+            cards = [card for card in live["microstructure"]["evidence"] if card.get("label")]
+            if cards:
+                break
+            assert time.monotonic() < deadline
+            time.sleep(.025)
+        card = cards[0]
+        assert card["prediction"]["impact_ticks"] == 1
+        assert card["prediction"]["refill_contracts"] == 5
+        assert card["label"]["impact_ticks"] == 11
+        checkpoint = live["capture_checkpoint"]
+        captured = replay(path, checkpoint["session_id"], "B", 1000, strict=True,
+                          through_id=checkpoint["durable_position"], as_of=observation(checkpoint["as_of"]))
+        assert semantic(captured["snapshot"]) == semantic(live["microstructure"])

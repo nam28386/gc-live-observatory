@@ -46,3 +46,15 @@ uv run --locked python -m scripts.benchmark_phase02 --events 10000 --writes 1000
 ```
 
 Use mode A for Trade/BBO, B to add MBP and C to add DBO. The default remains A. Open the dashboard on IPv4 loopback port 8000. A local capture can be inspected independently with `uv run --locked python -m observatory.replay <database> <session-id> --mode C`. Use the recorder's session ID and select the captured mode. See [measurement integrity](docs/MEASUREMENT_INTEGRITY.md) for eligibility and [Windows validation](docs/WINDOWS_LIVE_VALIDATION.md) for the entitlement checks.
+
+## Phase 03 capture and validation
+
+Capture remains optional. Supply a new local SQLite file outside Git and choose the batch bound if needed.
+
+```bash
+uv run --locked python -m observatory mock --mode C --capture /tmp/gc-pilot.sqlite --batch-size 32
+uv run --locked python -m observatory.diagnose --port 8000
+uv run --locked python -m scripts.benchmark_phase03 --mode B --cycles 2000 --batch-size 32
+```
+
+Use the session and position reported in `GET /api/snapshot` for `observatory.replay <db> <session> --through-id <id> --strict`. Use `observatory.dataset <db> <new-output-directory> --session <id>` to extract H-GC-001 engineering candidates. An input using legacy or pruned capture data is rejected in strict mode. See the [Phase 03 evidence and contracts](docs/PHASE03_EVIDENCE.md) and [Windows operator procedures](docs/WINDOWS_LIVE_VALIDATION.md).

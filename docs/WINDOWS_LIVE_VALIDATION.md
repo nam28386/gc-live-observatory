@@ -38,3 +38,22 @@ uv run --locked python -m observatory mbo-probe --symbol $Symbol --expiry $Expir
 ```
 
 The probe emits only the entitlement result. A negative probe or a failed probe leaves B usable. Verify an observed DBO update and look at exact and inferred Fill counts independently. LIVE on Windows and both depth entitlements remain unverified until checked on the local gateway.
+
+## Phase 03 pilot report
+
+Run the existing setup and loopback checks. Run A first, B after A passes and C only after a positive local probe. These commands assume the repo root and operator-confirmed `$Symbol` and `$Expiry`.
+
+```powershell
+.\scripts\windows\run-live.ps1 -Symbol $Symbol -Expiry $Expiry -Mode A
+.\scripts\windows\smoke.ps1 -Symbol $Symbol -Expiry $Expiry -Mode A
+uv run --locked python -m observatory.diagnose --port 8000 --gateway-port 9001
+.\scripts\windows\stop.ps1
+```
+
+Use separate consoles for the foreground run and the checks. To save an allowlisted diagnostic report add `--output "$env:LOCALAPPDATA\gc-pilot-report.json"` using a new file. The report omits raw events, prices, account fields and gateway logs. TCP reachability, matching ACK and observed trade/depth gates are operational evidence. Confirm the expiry and data entitlement independently using the local gateway. Record only sanitized outcomes.
+
+To test local capture after confirming retention rights, use `-Capture -BatchSize 32`. For a one-record comparison use `-Capture -BatchSize 1`. Both use FULL durability. Inspect throughput, producer backlog and commit p95/p99 during the session. A nonzero backlog is pressure evidence, and a failed recorder invalidates publication. The session end writes a local `capture_summary` record on graceful shutdown. It contains local coverage diagnostics rather than a claim of exchange completeness.
+
+`-Calendar <local JSON>` uses operator-sourced COMEX GC intervals. Use schema version 1, `exchange: COMEX`, `product: GC`, `exchange_timezone: America/New_York`, `version`, `provenance`, explicit UTC `coverage_start` and `coverage_end`, and an ordered `open_sessions` array of `id`, `open` and `close`. Verify coverage against the [CME product specification](https://www.cmegroup.com/markets/metals/precious/gold.contractSpecs.html) and [holiday schedule](https://www.cmegroup.com/tools-information/holiday-calendar.html). The app returns `UNKNOWN` when there is no calendar coverage or the source is Mock. Expiry and roll selection remain explicit operator inputs.
+
+Real Windows gateway, MBP and DBO remain **UNVERIFIED** until the local pilot is run.
