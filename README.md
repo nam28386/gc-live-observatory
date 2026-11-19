@@ -4,7 +4,7 @@ GC Live Observatory is a read-only COMEX GC observation and research workstation
 
 ## Windows source release candidate
 
-Install uv and Python 3.12 with the locked dependencies, then test the extracted RC using the [Windows quickstart and operator guide](docs/WINDOWS_LIVE_VALIDATION.md). The release ZIP and its SHA256 sidecar are built from an exact Git SHA. For maintainers, run from a Git checkout:
+Install uv and Python 3.12 with the locked dependencies, then test the extracted RC using the [Windows quickstart and operator guide](docs/WINDOWS_LIVE_VALIDATION.md). The Windows Python 3.12 Actions artifact contains an exact-SHA source ZIP, checksum and synthetic closeout evidence. Verify the inner ZIP using its SHA256 sidecar. For maintainers, run from a Git checkout:
 
 ```powershell
 $Sha = git rev-parse HEAD

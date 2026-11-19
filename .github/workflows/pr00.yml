@@ -17,10 +17,15 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
       - uses: astral-sh/setup-uv@v7
         with:
           version: '0.13.6'
       - run: uv sync --locked --python 3.12
+      - if: runner.os == 'Linux'
+        name: Audit reachable public repository history
+        run: uv run --locked python -m scripts.audit_public_repository
       - run: uv run --locked python -m pytest -q -m "not browser"
       - if: runner.os == 'Linux'
         run: uv run --locked python -m playwright install --with-deps chromium
@@ -49,10 +54,17 @@ jobs:
         shell: pwsh
         run: |
           $build = Join-Path $env:RUNNER_TEMP 'gc-release'
-          uv run --locked python -m scripts.build_windows_rc --sha $env:GITHUB_SHA --output $build
+          $rebuild = Join-Path $env:RUNNER_TEMP 'gc-release-rebuild'
+          New-Item -ItemType Directory -Path $build | Out-Null
+          uv run --locked python -m scripts.build_windows_rc --sha $env:GITHUB_SHA --output $build | Tee-Object -FilePath (Join-Path $build 'build-windows-py312.json')
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          uv run --locked python -m scripts.build_windows_rc --sha $env:GITHUB_SHA --output $rebuild
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           $zip = @(Get-ChildItem $build -Filter '*.zip')
           if ($zip.Count -ne 1) { throw 'Expected exactly one Windows RC ZIP' }
+          $first = Get-FileHash -Algorithm SHA256 -LiteralPath $zip[0].FullName
+          $second = Get-FileHash -Algorithm SHA256 -LiteralPath (Join-Path $rebuild $zip[0].Name)
+          if ($first.Hash -ne $second.Hash) { throw 'Two same-SHA Windows source ZIP builds disagree' }
           uv run --locked python -m scripts.build_windows_rc --sha $env:GITHUB_SHA --verify $zip[0].FullName
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           $clean = Join-Path $env:RUNNER_TEMP 'GC Observatory Clean Install'
@@ -60,7 +72,9 @@ jobs:
           Push-Location $clean
           try {
             .\scripts\windows\install.ps1
-            uv run --locked python -m scripts.windows_acceptance --expected-sha $env:GITHUB_SHA
+            uv run --locked python -m scripts.windows_acceptance --expected-sha $env:GITHUB_SHA | Tee-Object -FilePath (Join-Path $build 'acceptance-windows-py312.json')
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+            uv run --locked python -m scripts.windows_acceptance --restart-only --restart-repeats 4 --expected-sha $env:GITHUB_SHA | Tee-Object -FilePath (Join-Path $build 'restart-windows-py312.json')
             if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           } finally { Pop-Location }
       - if: runner.os == 'Windows'
@@ -79,6 +93,13 @@ jobs:
       - if: runner.os == 'Windows'
         uses: actions/upload-artifact@v4
         with:
-          name: windows-source-rc-${{ github.sha }}
-          path: ${{ runner.temp }}/gc-release/*
+          name: windows-py312-source-rc-${{ github.sha }}
+          path: |
+            ${{ runner.temp }}/gc-release/*.zip
+            ${{ runner.temp }}/gc-release/*.zip.sha256
+            ${{ runner.temp }}/gc-release/build-windows-py312.json
+            ${{ runner.temp }}/gc-release/acceptance-windows-py312.json
+            ${{ runner.temp }}/gc-release/restart-windows-py312.json
+            ${{ runner.temp }}/gc-release/synthetic-windows-burst-b.json
+            ${{ runner.temp }}/gc-release/synthetic-windows-mixed-c.json
           if-no-files-found: error

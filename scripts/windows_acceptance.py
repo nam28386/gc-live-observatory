@@ -1,7 +1,7 @@
 """Exercise the installed launcher, dashboard, capture, replay and restart on a finite mock tape."""
 
 import argparse
-from contextlib import closing, contextmanager
+from contextlib import ExitStack, closing, contextmanager
 import json
 import os
 from pathlib import Path
@@ -44,8 +44,7 @@ def polling(server, port, ready):
             if ready(snapshot):
                 return snapshot
         time.sleep(.05)
-    # The full server log is printed by launch() on error. Report only
-    # bounded, synthetic, non-price operational state from the final snapshot.
+    # Report bounded, synthetic, non-price state from the last snapshot.
     summary = {"server_exit": server.poll(), "fetch_error": last_fetch_error}
     if last_snapshot is not None:
         status = last_snapshot.get("status", {})
@@ -64,7 +63,7 @@ def polling(server, port, ready):
             "queue_uncertain": receiver.get("uncertain_received_frames"),
             "rpc_counts": receiver.get("depthsnap_rpc", {}).get("counts", {}),
             "rpc_recent_outcomes": [
-                item.get("outcome")
+                item["outcomes"]
                 for item in receiver.get("depthsnap_rpc", {}).get("recent", [])[-4:]
             ],
             "ofi_status": ofi.get("status"),
@@ -90,7 +89,7 @@ def python(module, *args):
 
 def check(command, env, expected=0):
     run = subprocess.run(command, cwd=ROOT, env=env, capture_output=True, text=True, timeout=50)
-    if (run.returncode == 0) != (expected == 0):
+    if run.returncode != expected:
         raise RuntimeError(f"Operator command returned {run.returncode}, expected {expected}\n{run.stderr}")
     return run.stdout
 
@@ -101,10 +100,6 @@ def launch(command, env, log):
         server = subprocess.Popen(command, cwd=ROOT, env=env, stdout=output, stderr=subprocess.STDOUT)
         try:
             yield server
-        except Exception:
-            output.seek(0)
-            print(output.read(), file=sys.stderr, end="")
-            raise
         finally:
             if server.poll() is None:
                 # Windows PowerShell and uv may have spawned child processes.
@@ -116,19 +111,23 @@ def launch(command, env, log):
                 server.wait(timeout=10)
 
 
-def run_case(root, shell, port, requested, effective, *, capture=False, restart=False):
+def run_case(root, shell, port, requested, effective, *, database=None, previous_session=None):
+    started = time.monotonic()
+    capture = database is not None
+    restart = previous_session is not None
     case = f"{requested}{effective}{'-restart' if restart else ''}"
     env = {**os.environ, "LOCALAPPDATA": str(root)}
     runtime = root / "GCLiveObservatory"
     runtime.mkdir(exist_ok=True)
     marker = runtime / f"stop-{port}"
-    db = runtime / f"mock-{port}.sqlite"
+    db = database
+    assert not marker.exists()
     if shell:
         command = powershell(shell, "run-mock", "-Port", port, "-Mode", requested,
                              "-Interval", "0.04", "-TapeCycles", CYCLES, "-DisconnectAfter", DISCONNECT,
                              "-StaleAfter", 30)
         if capture:
-            command.append("-Capture")
+            command += ["-Capture", "-CapturePath", str(db)]
         if requested != effective:
             command.append("-NoSyntheticDbo")
     else:
@@ -140,12 +139,21 @@ def run_case(root, shell, port, requested, effective, *, capture=False, restart=
         if requested != effective:
             command.append("--no-synthetic-dbo")
 
+    trades = CYCLES - 2  # The intentional transport gap omits two cycles.
+    market = 2 * trades + 2  # Trade/BBO pairs and one initial BBO per connection.
+    if effective in ("B", "C"):
+        market += trades + 4  # Depth updates and a Reset/Image per connection.
+    if effective == "C":
+        market += trades + 2  # Four Reset/Image frames, minus two unseeded order updates.
+
     def ready(snapshot):
         s = snapshot["status"]
         micro = snapshot["microstructure"]
         receive = s["receiver"]
         return (
-            s["counters"].get("eligible_trade") == CYCLES - 2
+            s["counters"].get("eligible_trade") == trades
+            and receive["visible_market_frames"] == market
+            and (not capture or receive["durable_market_records"] == market)
             and receive["admitted_queue_frames"] == receive["settled_queue_frames"]
             and s["subscribe_ack"] and s["request_id"] == s["last_ack_request_id"]
             and (effective == "A" or (
@@ -200,7 +208,10 @@ def run_case(root, shell, port, requested, effective, *, capture=False, restart=
             session = snapshot["capture_checkpoint"]["session_id"]
             if restart:
                 records = json.loads(fetch(port, "/api/history?limit=30&gaps=true"))["records"]
-                assert any(row["kind"] == "restart_gap" and row["session_id"] == session for row in records)
+                assert session != previous_session
+                assert any(row["kind"] == "restart_gap" and row["session_id"] == session
+                           and row["payload"]["previous_session"] == previous_session
+                           and row["payload"]["termination"] == "clean" for row in records)
             diagnostic = root / f"{case}-diagnostic.json"
             checkpoint = root / f"{case}-private.json"
             check(python("observatory.diagnose", "--port", port, "--require-mode", effective,
@@ -209,7 +220,8 @@ def run_case(root, shell, port, requested, effective, *, capture=False, restart=
             assert "Stopped" in check(powershell(shell, "stop", "-Port", port, "-Synthetic"), env)
         else:
             marker.touch(exist_ok=False)
-        assert server.wait(timeout=22) == 0 and not marker.exists()
+        exit_code = server.wait(timeout=22)
+        assert exit_code == 0 and not marker.exists()
 
     with socket.socket() as listener:
         listener.settimeout(2)
@@ -228,14 +240,33 @@ def run_case(root, shell, port, requested, effective, *, capture=False, restart=
         assert final["capture_summary"]["committed_market_records"] == receiver["durable_market_records"]
         with closing(sqlite3.connect(db)) as connection:
             assert connection.execute("SELECT termination FROM sessions WHERE id=?", (session,)).fetchone() == ("clean",)
-        return session, status["software_revision"]
-    return None
+    else:
+        session = None
+    return session, status["software_revision"], {
+        "scenario": case, "duration_seconds": round(time.monotonic() - started, 3),
+        "launcher_exit": exit_code, "listener_closed": True, "stop_marker_removed": True,
+        "settled_market_frames": market, "checkpoint_parity": "PASS" if capture else "NOT_APPLICABLE",
+    }
+
+
+def select_ports(count):
+    with ExitStack() as stack:
+        ports = []
+        while len(ports) < count:
+            listener = stack.enter_context(socket.socket())
+            listener.bind(("127.0.0.1", 0))
+            port = listener.getsockname()[1]
+            if port != 9001:
+                ports.append(port)
+        return iter(ports)
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--powershell", help="PowerShell executable for the operator path")
     parser.add_argument("--expected-sha")
+    parser.add_argument("--restart-repeats", type=int, choices=range(1, 7), default=1)
+    parser.add_argument("--restart-only", action="store_true")
     args = parser.parse_args()
     shell = args.powershell or (shutil.which("pwsh") if os.name == "nt" else None)
     if os.name == "nt" and not shell:
@@ -252,19 +283,27 @@ def main():
                 nonlocal_listener.listen(1)
                 check(powershell(shell, "preflight", "-Port", nonlocal_listener.getsockname()[1],
                                  "-Synthetic", "-Running"), env, expected=1)
-        with socket.socket() as listener:
-            listener.bind(("127.0.0.1", 0))
-            port = listener.getsockname()[1]
-        for requested, effective in (("A", "A"), ("B", "B"), ("C", "B")):
-            run_case(root, shell, port, requested, effective)
-        first, revision = run_case(root, shell, port, "C", "C", capture=True)
-        second, reopened_revision = run_case(root, shell, port, "C", "C", capture=True, restart=True)
-        assert first != second and revision == reopened_revision
-        if args.expected_sha:
-            assert revision == args.expected_sha
+        ports = select_ports(2 * args.restart_repeats + (0 if args.restart_only else 3))
+        results = []
+        if not args.restart_only:
+            for requested, effective in (("A", "A"), ("B", "B"), ("C", "B")):
+                _, _, result = run_case(root, shell, next(ports), requested, effective)
+                results.append(result)
+        for repeat in range(1, args.restart_repeats + 1):
+            pair_root = root / f"capture-{repeat}"
+            pair_root.mkdir()
+            database = pair_root / "mock.sqlite"
+            first, revision, started = run_case(pair_root, shell, next(ports), "C", "C", database=database)
+            _, reopened_revision, restarted = run_case(
+                pair_root, shell, next(ports), "C", "C", database=database, previous_session=first,
+            )
+            assert revision == reopened_revision
+            if args.expected_sha:
+                assert revision == args.expected_sha
+            results.extend({**result, "pair": repeat} for result in (started, restarted))
     print(json.dumps({"source": "SYNTHETIC", "platform": sys.platform,
-                      "launcher": "PowerShell" if shell else "Python", "modes": ["A", "B", "C", "C-to-B"],
-                      "reconnect": "PASS", "capture_replay_evidence_restart": "PASS", "sha": revision}))
+                      "launcher": "PowerShell" if shell else "Python", "restart_pairs": args.restart_repeats,
+                      "capture_replay_evidence_restart": "PASS", "sha": revision, "scenarios": results}))
 
 
 if __name__ == "__main__":

@@ -75,7 +75,12 @@ def test_live_adapter_reads_synthetic_vendor_socket_and_local_history(tmp_path):
                 assert data["status"]["last_volume_update"] == data["status"]["last_bbo_message"]
                 assert data["status"]["counters"]["volume_updates"] == 2
                 assert data["status"]["counters"]["oi_updates"] == 1
-                rows = client.get("/api/history").json()["records"]
+                assert client.get("/api/history").status_code == 403
+                timeline = client.get("/api/history?gaps=true").json()["records"]
+                assert [row["kind"] for row in timeline] == ["coverage_start"]
+                assert timeline[0]["payload"] == {}
+                assert timeline[0]["provenance"] == {"symbol": "GCZ6", "source": "fxaurum_rithmic"}
+                rows = Journal(tmp_path / "capture.sqlite", {}).history(read_only=True)
                 assert [row["kind"] for row in rows][:2] == ["ack", "bbo"]
                 assert rows[-1]["kind"] == "trade"
                 first, second = [row for row in rows if row["kind"] == "bbo"]
@@ -86,7 +91,6 @@ def test_live_adapter_reads_synthetic_vendor_socket_and_local_history(tmp_path):
                 assert data["status"]["last_volume_update"] == second["payload"]["event"]["observed"]
                 assert any(row["payload"].get("reason") == "future_trade_time" for row in rows)
                 assert json.loads(rows[-1]["payload"]["raw"])["data"]["T"] == fixture.trade(0)["T"]
-                assert len(client.get("/api/history?limit=1").json()["records"]) == 1
                 assert client.get("/api/history", headers={"Host": "foreign.example"}).status_code == 400
                 with pytest.raises(WebSocketDisconnect):
                     with client.websocket_connect("ws://127.0.0.1/ws", headers={"origin": "http://foreign.example"}):

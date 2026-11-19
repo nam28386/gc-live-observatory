@@ -13,6 +13,7 @@ from .events import Instrument
 # Virtual exchange time is deliberately unrelated to wall-clock time.
 START_MS = 1_763_568_000_000
 TRADE_STEP_MS = 43_000
+DEPTH_GAP_INDEX = 12
 
 
 class MockGateway:
@@ -29,6 +30,7 @@ class MockGateway:
         self.seq = 0
         self.ask_size = 10
         self.tape_cycles = tape_cycles
+        self.snapshot_sent = asyncio.Event()
 
     @property
     def streams(self):
@@ -67,6 +69,7 @@ class MockGateway:
                     and params == {"exchange": self.instrument.exchange, "symbol": self.instrument.symbol}
                 ):
                     await self.reply_snapshot(socket, request_id)
+                    self.snapshot_sent.set()
                     continue
                 if (
                     request.get("method") != "SUBSCRIBE"
@@ -127,7 +130,7 @@ class MockGateway:
                 await self.send(socket, self.instrument.streams[0], self.trade(index))
                 await self.send(socket, self.instrument.streams[1], self.quote(index))
                 if self.mode != "A":
-                    self.seq += 2 if index == 12 else 1
+                    self.seq += 2 if index == DEPTH_GAP_INDEX else 1
                     self.ask_size = 5 + index % 9
                     await self.send(socket, self.streams[2], {
                         "type": "Update", "gen": self.generation, "seq": self.seq, "src": 0,
@@ -150,6 +153,15 @@ class MockGateway:
                     if index // 4 != initial_index // 4 or initial_index % 4 == 0:
                         await self.send(socket, self.streams[3], order)
                 if not self.disconnected_once and self.index == self.disconnect_after:
+                    if self.tape_cycles is not None and self.mode != "A" and index >= DEPTH_GAP_INDEX:
+                        # The finite acceptance tape demands one RPC repair before
+                        # the deliberate transport gap. Under FIFO commit pressure
+                        # the collector may request it only after the market tail.
+                        try:
+                            await asyncio.wait_for(self.snapshot_sent.wait(), timeout=5)
+                        except TimeoutError:
+                            await socket.close(code=1011, reason="synthetic recovery barrier expired")
+                            return
                     self.disconnected_once = True
                     # Advance the fixture clock across two unobserved prints.
                     self.index += 2

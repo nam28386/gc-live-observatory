@@ -215,10 +215,18 @@ def create_app(
                       limit: int = Query(100, ge=1, le=250), gaps: bool = False):
         if journal is None:
             raise HTTPException(404, "Local capture is disabled")
+        if live and not gaps:
+            raise HTTPException(403, "LIVE history is limited to the gap timeline; use local replay for capture data")
         try:
             records = await journal.io(journal.history, after, limit, gaps=gaps)
         except JournalError:
             raise HTTPException(503, "Local capture is unavailable") from None
+        if live:
+            records = [{
+                **{key: row[key] for key in ("schema_version", "id", "utc_ns", "kind")},
+                "payload": {key: row["payload"][key] for key in ("reason", "from_utc_ns") if key in row["payload"]},
+                "provenance": {key: row["provenance"][key] for key in ("symbol", "source")},
+            } for row in records]
         return {"records": records}
 
     @app.websocket("/ws")

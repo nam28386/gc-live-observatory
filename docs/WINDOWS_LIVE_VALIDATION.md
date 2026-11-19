@@ -154,3 +154,50 @@ The sanitized packet includes observed receipt/admission/settlement and publicat
 | Unavailable DBO | Check probe and observed updates independently. Keep B if available. |
 | Capture pressure or recorder failure | Review queue occupancy, uncertain receipts, storage status and durable position. Check free space and write permissions. |
 | Missing capture authorization | Leave capture off until data-use and retention rights are confirmed. |
+
+## Release closeout and local-data boundary
+
+Use the `windows-py312-source-rc-<full SHA>` Actions artifact for the approved
+commit. Extract the Actions wrapper, then verify the **inner** source ZIP
+against its sibling `.zip.sha256` file. The build report identifies the SHA,
+build OS, Python and Git versions. The ZIP contains stored, unmodified Git
+blobs in sorted order with fixed metadata. CI compares two Windows builds of
+the same SHA. Compare a specific Linux build with the Windows inner ZIP
+before citing cross-platform byte equality.
+
+After installing from the verified extraction, the full synthetic acceptance
+checks the A/B/C and fallback paths. The optional repeat command tests four
+independent Mode C capture/reopen pairs:
+
+```powershell
+uv run --locked python -m scripts.windows_acceptance --expected-sha $Sha
+uv run --locked python -m scripts.windows_acceptance --restart-only --restart-repeats 4 --expected-sha $Sha
+```
+
+Each pair shares one synthetic SQLite file across two processes on distinct
+loopback ports. Each process must finish the finite durable tape, stop with
+exit code zero, remove its stop marker and close its listener. The second
+session must identify the first as its clean predecessor. Replay and the
+sanitized evidence builder verify both prefixes. The synthetic gateway waits
+for the requested repair response before intentionally closing the first
+connection, including when the collector requests that response after the
+market-data tail.
+
+LIVE HTTP history serves a projected gap timeline. Use the local replay CLI
+for retained event records. Keep databases, replay output, full checkpoints,
+credentials and broker diagnostics outside Git and release artifacts. The
+dashboard displays entitled observations on IPv4 loopback. Confirm the
+terms of the applicable Fxaurum, Rithmic and exchange market-data agreements
+before retaining data or sharing any data or derived material. API
+documentation and synthetic entitlement are engineering references. Rights,
+LIVE A/B/C, real capture capacity and authorized real out-of-sample validation
+require independent operator evidence.
+Public visibility does not provide a source-code redistribution license. The
+repository currently has no standalone LICENSE file. Confirm redistribution
+permissions with the repository owner and applicable data agreements.
+
+CI scans credential signatures and private artifact paths in reachable Git
+history and checks an exact-SHA allowlist when building and verifying the
+inner ZIP. This scan cannot cover unreachable history, external copies or
+arbitrary disguised data. The upload step enumerates the source ZIP,
+checksum, build metadata and synthetic operational summaries explicitly.
