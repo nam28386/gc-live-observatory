@@ -20,7 +20,17 @@ h1 { font-size: clamp(23px, 4vw, 34px); font-weight: 650; letter-spacing: -.035e
 #instrument, #delivery, .market-value span, .diagnostics span { color: var(--muted); font-size: .82rem; }
 #instrument { margin-top: 4px; }
 .top-status { display: grid; gap: 5px; justify-items: end; text-align: right; }
-.mock { color: var(--gold); font-size: .74rem; font-weight: 700; letter-spacing: .075em; white-space: nowrap; }
+.source-mode {
+  color: var(--muted);
+  border: 1px solid currentColor;
+  border-radius: 4px;
+  padding: 5px 8px;
+  font-size: clamp(.82rem, 2vw, 1.1rem);
+  font-weight: 750;
+  letter-spacing: .045em;
+}
+.source-mode[data-source="MOCK"] { color: var(--gold); }
+.source-mode[data-source="LIVE"] { color: var(--green); }
 .market, .diagnostics {
   display: grid;
   grid-template-columns: repeat(4, minmax(0, 1fr));

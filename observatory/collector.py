@@ -90,10 +90,17 @@ class Collector:
         self.recovery_dispatch_ms = None
         self.recovery_publication_ms = None
         self.freshness_samples = {key: Counter() for key in ("trade", "bbo", "mbp", "mbo")}
+        self.stopping = asyncio.Event()
+        self.socket = None
+
+    async def stop(self) -> None:
+        self.stopping.set()
+        if self.socket is not None:
+            await self.socket.close()
 
     async def run(self) -> None:
         delay = self.retry_delay
-        while True:
+        while not self.stopping.is_set():
             reason = "collector_stopped"
             try:
                 # Bounded frame buffering applies transport backpressure. No event
@@ -103,6 +110,9 @@ class Collector:
                     max_queue=MAX_QUEUE_FRAMES, open_timeout=2, close_timeout=1,
                     ping_interval=10, ping_timeout=10,
                 ) as socket:
+                    self.socket = socket
+                    if self.stopping.is_set():
+                        return
                     self.next_request_id += 1
                     self.connection_epoch += 1
                     self.connection_uncertain_base = self.uncertain_receipts
@@ -110,8 +120,9 @@ class Collector:
                     await self.subscribe(socket, self.next_request_id)
                     delay = self.retry_delay
                     await self.receive_market(socket)
-                    reason = "client_socket_closed"
-                    self.state.issue(reason)
+                    if not self.stopping.is_set():
+                        reason = "client_socket_closed"
+                        self.state.issue(reason)
             except JournalError:
                 reason = "recorder_failed"
                 self.state.recorder_error = True
@@ -141,6 +152,7 @@ class Collector:
                 reason = "client_socket_error" if self.state.connected else "connect_failed"
                 self.state.issue(reason)
             finally:
+                self.socket = None
                 if self.state.connected:
                     try:
                         async with self.publication():
@@ -150,7 +162,10 @@ class Collector:
                         self.state.issue("recorder_failed")
             if self.state.recorder_error:
                 return
-            await asyncio.sleep(delay)
+            try:
+                await asyncio.wait_for(self.stopping.wait(), timeout=delay)
+            except TimeoutError:
+                pass
             delay = min(delay * 2, 5.0)
 
     @asynccontextmanager

@@ -1,6 +1,17 @@
 # GC Live Observatory
 
-PR00 runs a synthetic COMEX GC market-data workflow on a developer machine. The browser receives live updates from FastAPI, which reads the state built by a Python collector connected to a real Fxaurum-shaped mock WebSocket. The synthetic exchange clock advances 43 seconds per print. The dashboard marks its source **MOCK / SYNTHETIC** throughout.
+GC Live Observatory is a read-only COMEX GC observation and research workstation with a synthetic mode for local testing. The browser receives live updates from FastAPI, which reads the state built by a Python collector connected to a real Fxaurum-shaped mock WebSocket. The synthetic exchange clock advances 43 seconds per print. The dashboard marks its source **MOCK / SYNTHETIC** throughout.
+
+## Windows source release candidate
+
+Install uv and Python 3.12 with the locked dependencies, then test the extracted RC using the [Windows quickstart and operator guide](docs/WINDOWS_LIVE_VALIDATION.md). The Windows Python 3.12 Actions artifact contains an exact-SHA source ZIP, checksum and synthetic closeout evidence. Verify the inner ZIP using its SHA256 sidecar. For maintainers, run from a Git checkout:
+
+```powershell
+$Sha = git rev-parse HEAD
+uv run --locked python -m scripts.build_windows_rc --sha $Sha --output "$env:TEMP\gc-release"
+```
+
+The archive contains the app and launchers. Dependencies are installed separately. Real Fxaurum access and capture remain local to the authorized Windows workstation.
 
 ## Run locally
 

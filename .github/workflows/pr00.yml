@@ -2,7 +2,7 @@ name: Observatory synthetic validation
 
 on:
   push:
-    branches: [main, feat/phase01-live-ready, feat/phase02-microstructure-engine, feat/phase03-live-capture-reliability, feat/phase04-live-wave-research, feat/phase05-windows-live-commissioning]
+    branches: [main, feat/phase01-live-ready, feat/phase02-microstructure-engine, feat/phase03-live-capture-reliability, feat/phase04-live-wave-research, feat/phase05-windows-live-commissioning, feat/full-project-delivery]
   pull_request:
 
 permissions:
@@ -17,10 +17,15 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
       - uses: astral-sh/setup-uv@v7
         with:
           version: '0.13.6'
       - run: uv sync --locked --python 3.12
+      - if: runner.os == 'Linux'
+        name: Audit reachable public repository history
+        run: uv run --locked python -m scripts.audit_public_repository
       - run: uv run --locked python -m pytest -q -m "not browser"
       - if: runner.os == 'Linux'
         run: uv run --locked python -m playwright install --with-deps chromium
@@ -44,3 +49,95 @@ jobs:
             uv run --locked python -m pytest -q tests/test_phase03_recovery.py tests/test_phase04_recovery.py tests/test_phase05_rpc.py
             if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           }
+      - if: runner.os == 'Windows'
+        name: Build, verify and smoke the Windows source RC
+        shell: pwsh
+        run: |
+          $build = Join-Path $env:RUNNER_TEMP 'gc-release'
+          $rebuild = Join-Path $env:RUNNER_TEMP 'gc-release-rebuild'
+          New-Item -ItemType Directory -Path $build | Out-Null
+          uv run --locked python -m scripts.build_windows_rc --sha $env:GITHUB_SHA --output $build | Tee-Object -FilePath (Join-Path $build 'build-windows-py312.json')
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          uv run --locked python -m scripts.build_windows_rc --sha $env:GITHUB_SHA --output $rebuild
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $zip = @(Get-ChildItem $build -Filter '*.zip')
+          if ($zip.Count -ne 1) { throw 'Expected exactly one Windows RC ZIP' }
+          $first = Get-FileHash -Algorithm SHA256 -LiteralPath $zip[0].FullName
+          $second = Get-FileHash -Algorithm SHA256 -LiteralPath (Join-Path $rebuild $zip[0].Name)
+          if ($first.Hash -ne $second.Hash) { throw 'Two same-SHA Windows source ZIP builds disagree' }
+          uv run --locked python -m scripts.build_windows_rc --sha $env:GITHUB_SHA --verify $zip[0].FullName
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $clean = Join-Path $env:RUNNER_TEMP 'GC Observatory Clean Install'
+          Expand-Archive -LiteralPath $zip[0].FullName -DestinationPath $clean
+          Push-Location $clean
+          try {
+            .\scripts\windows\install.ps1
+            uv run --locked python -m scripts.windows_acceptance --expected-sha $env:GITHUB_SHA | Tee-Object -FilePath (Join-Path $build 'acceptance-windows-py312.json')
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+            uv run --locked python -m scripts.windows_acceptance --restart-only --restart-repeats 4 --expected-sha $env:GITHUB_SHA | Tee-Object -FilePath (Join-Path $build 'restart-windows-py312.json')
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          } finally { Pop-Location }
+      - if: runner.os == 'Windows'
+        name: Measure packaged synthetic capture and replay
+        shell: pwsh
+        run: |
+          $build = Join-Path $env:RUNNER_TEMP 'gc-release'
+          $clean = Join-Path $env:RUNNER_TEMP 'GC Observatory Clean Install'
+          Push-Location $clean
+          try {
+            uv run --locked python -m scripts.benchmark_phase03 --mode B --cycles 2000 --batch-size 32 | Tee-Object -FilePath (Join-Path $build 'synthetic-windows-burst-b.json')
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+            uv run --locked python -m scripts.benchmark_phase03 --mode C --cycles 2000 --batch-size 32 | Tee-Object -FilePath (Join-Path $build 'synthetic-windows-mixed-c.json')
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          } finally { Pop-Location }
+      - if: runner.os == 'Windows'
+        name: Summarize public Windows RC evidence
+        shell: pwsh
+        run: |
+          $build = Join-Path $env:RUNNER_TEMP 'gc-release'
+          $release = Get-Content (Join-Path $build 'build-windows-py312.json') -Raw | ConvertFrom-Json
+          $acceptance = Get-Content (Join-Path $build 'acceptance-windows-py312.json') -Raw | ConvertFrom-Json
+          $stress = Get-Content (Join-Path $build 'restart-windows-py312.json') -Raw | ConvertFrom-Json
+          if ($release.source_sha -ne $env:GITHUB_SHA -or $acceptance.sha -ne $env:GITHUB_SHA -or
+              $stress.sha -ne $env:GITHUB_SHA -or $stress.restart_pairs -ne 4) {
+            throw 'Release evidence identity or repeat count mismatch'
+          }
+          Write-Output "::notice title=Windows inner source ZIP::$($release.file) | $($release.bytes) bytes | SHA256 $($release.sha256)"
+          foreach ($workload in @('burst-b', 'mixed-c')) {
+            $row = Get-Content (Join-Path $build "synthetic-windows-$workload.json") -Raw | ConvertFrom-Json
+            Write-Output "::notice title=Windows synthetic $workload::$($row.processed_stream_frames) frames | $($row.durable_market_events_per_second) durable frames/s | $($row.replay_records_per_second) replay records/s | $($row.receiver.uncertain_received_frames) uncertain"
+          }
+          @(
+            '## Windows source RC'
+            "- Commit: $($release.source_sha)"
+            "- Inner ZIP: $($release.file), $($release.bytes) bytes"
+            "- Inner SHA256: $($release.sha256)"
+            "- Build basis: $($release.build_os), Python $($release.python), $($release.git), $($release.zip_encoding) ZIP"
+            "- Standard synthetic acceptance: $($acceptance.capture_replay_evidence_restart)"
+            "- Synthetic restart pairs: $($stress.restart_pairs)"
+            '| Pair | Scenario | Seconds | Exit | Listener closed | Stop marker removed | Durable market frames | Replay parity |'
+            '| --- | --- | ---: | ---: | --- | --- | ---: | --- |'
+            foreach ($case in $stress.scenarios) {
+              "| $($case.pair) | $($case.scenario) | $($case.duration_seconds) | $($case.launcher_exit) | $($case.listener_closed) | $($case.stop_marker_removed) | $($case.settled_market_frames) | $($case.checkpoint_parity) |"
+            }
+            ''
+            '| Synthetic benchmark | Market frames | Durable frames/s | Replay records/s | Queue high | Uncertain |'
+            '| --- | ---: | ---: | ---: | ---: | ---: |'
+            foreach ($workload in @('burst-b', 'mixed-c')) {
+              $row = Get-Content (Join-Path $build "synthetic-windows-$workload.json") -Raw | ConvertFrom-Json
+              "| $workload | $($row.processed_stream_frames) | $($row.durable_market_events_per_second) | $($row.replay_records_per_second) | $($row.receiver.receive_queue_high_water) | $($row.receiver.uncertain_received_frames) |"
+            }
+          ) | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Append
+      - if: runner.os == 'Windows'
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-py312-source-rc-${{ github.sha }}
+          path: |
+            ${{ runner.temp }}/gc-release/*.zip
+            ${{ runner.temp }}/gc-release/*.zip.sha256
+            ${{ runner.temp }}/gc-release/build-windows-py312.json
+            ${{ runner.temp }}/gc-release/acceptance-windows-py312.json
+            ${{ runner.temp }}/gc-release/restart-windows-py312.json
+            ${{ runner.temp }}/gc-release/synthetic-windows-burst-b.json
+            ${{ runner.temp }}/gc-release/synthetic-windows-mixed-c.json
+          if-no-files-found: error

@@ -16,23 +16,25 @@ from .quality import SessionCalendar
 from .web import create_app
 
 
-async def serve(config: uvicorn.Config, stop_file: Path) -> None:
+async def serve(config: uvicorn.Config, stop_file: Path | None) -> None:
     server = uvicorn.Server(config)
 
     async def wait_for_stop():
         while not stop_file.is_file():
             await asyncio.sleep(0.25)
-        stop_file.unlink()
         server.should_exit = True
 
-    watcher = asyncio.create_task(wait_for_stop())
+    watcher = asyncio.create_task(wait_for_stop()) if stop_file else None
     try:
         await server.serve()
     finally:
-        watcher.cancel()
-        await asyncio.gather(watcher, return_exceptions=True)
-    if not server.started:
+        if watcher:
+            watcher.cancel()
+            await asyncio.gather(watcher, return_exceptions=True)
+    if not server.started or server.lifespan.error_occurred or config.app.state.collector.state.recorder_error:
         raise SystemExit(1)
+    if stop_file:
+        stop_file.unlink(missing_ok=True)
 
 
 def local_path(value: Path) -> Path:
@@ -69,12 +71,17 @@ def main() -> None:
     mock = subcommands.add_parser("mock", help="run a local synthetic gateway and dashboard")
     mock.add_argument("--interval", default=0.16, type=float, help="seconds between synthetic trades")
     mock.add_argument("--disconnect-after", type=int, help="force one synthetic socket loss after N trades")
+    mock.add_argument("--tape-cycles", type=int, choices=range(1, 10001), metavar="1..10000")
+    mock.add_argument("--no-synthetic-dbo", action="store_true", help="exercise C-to-B fallback")
+    mock.add_argument("--stale-after", type=float, default=3)
     live = subcommands.add_parser("live", help="observe the local Windows Fxaurum gateway")
     live.add_argument("--symbol", required=True)
     live.add_argument("--expiry", required=True, help="operator-confirmed contract expiry, YYYY-MM-DD")
     live.add_argument("--gateway-port", type=int, default=9001)
     live.add_argument("--stale-after", type=float, default=10)
-    live.add_argument("--stop-file", type=Path)
+    live.add_argument("--expiry-attested", action="store_true")
+    live.add_argument("--retention-attested", action="store_true",
+                      help="operator confirms authorization to use and retain this feed")
     live.add_argument("--calendar", type=Path, help="local sourced COMEX GC session interval registry")
     live.add_argument("--mbo-entitled", action="store_true", help="operator's positive local mboProbe result")
     mbo_probe = subcommands.add_parser("mbo-probe", help="verify DBO entitlement from the Windows gateway")
@@ -82,6 +89,7 @@ def main() -> None:
     mbo_probe.add_argument("--expiry", required=True)
     mbo_probe.add_argument("--gateway-port", type=int, default=9001)
     for command in (mock, live):
+        command.add_argument("--stop-file", type=Path)
         command.add_argument("--mode", choices=("A", "B", "C"), default="A")
         command.add_argument("--port", default=8000, type=int)
         command.add_argument("--capture", type=Path, help="opt-in journal database outside all Git checkouts")
@@ -104,26 +112,29 @@ def main() -> None:
     try:
         capture = local_path(args.capture) if args.capture else None
         options = dict(capture_path=capture, retention_days=args.retention_days, mode=args.mode, batch_size=args.batch_size)
-        stop_file = None
+        if not math.isfinite(args.stale_after) or args.stale_after <= 0:
+            parser.error("--stale-after must be a positive finite number")
+        stop_file = local_path(args.stop_file) if args.stop_file else None
+        if stop_file and stop_file.exists():
+            parser.error("The stop marker already exists")
         if args.command == "mock":
             if not math.isfinite(args.interval) or args.interval <= 0:
                 parser.error("--interval must be a positive finite number")
             if args.disconnect_after is not None and args.disconnect_after < 1:
                 parser.error("--disconnect-after must be positive")
-            app = create_app(interval=args.interval, disconnect_after=args.disconnect_after, **options)
+            app = create_app(interval=args.interval, disconnect_after=args.disconnect_after, stale_after=args.stale_after,
+                             mock_mbo_available=not args.no_synthetic_dbo, mock_cycles=args.tape_cycles, **options)
         else:
             if sys.platform != "win32":
                 parser.error("LIVE is available only on Windows")
             if not 1 <= args.gateway_port <= 65535 or args.gateway_port == args.port:
                 parser.error("Specify a valid gateway port distinct from the dashboard port")
-            if not math.isfinite(args.stale_after) or args.stale_after <= 0:
-                parser.error("--stale-after must be a positive finite number")
-            stop_file = local_path(args.stop_file) if args.stop_file else None
-            if stop_file and stop_file.exists():
-                parser.error("The stop marker already exists")
+            if capture and not args.retention_attested:
+                parser.error("LIVE capture requires explicit data-use and retention authorization (--retention-attested)")
             app = create_app(instrument=gc_contract(args.symbol, args.expiry),
                              live_gateway_port=args.gateway_port, stale_after=args.stale_after,
                              mbo_entitled=args.mbo_entitled, calendar=SessionCalendar.load(args.calendar) if args.calendar else None,
+                             expiry_attested=args.expiry_attested, retention_attested=args.retention_attested,
                              **options)
     except (OSError, ValueError) as exc:
         parser.error(str(exc))
@@ -131,10 +142,7 @@ def main() -> None:
         app, host="127.0.0.1", port=args.port, ws="websockets-sansio",
         ws_max_size=64 * 1024, timeout_graceful_shutdown=2, proxy_headers=False,
     )
-    if stop_file:
-        asyncio.run(serve(config, stop_file))
-    else:
-        uvicorn.Server(config).run()
+    asyncio.run(serve(config, stop_file))
 
 
 if __name__ == "__main__":

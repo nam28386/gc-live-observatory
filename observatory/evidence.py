@@ -33,6 +33,13 @@ RPC_OUTCOMES = {
     "RPC_LOCAL_BACKPRESSURE", "RPC_COMMIT_FAILURE", "RPC_RECOVERY_FAILED",
     "RPC_PUBLICATION_DELAY", "RPC_SUPERSEDED_BY_STREAM_IMAGE",
 }
+RECEIVER_TOTALS = (
+    "socket_received_frames", "admitted_queue_frames", "settled_queue_frames", "normalized_market_frames",
+    "durable_market_records", "visible_market_frames", "uncertain_received_frames", "receive_queue_high_water",
+    "receive_queue_capacity", "receive_pressure_count", "depthsnap_send_to_receipt_ms",
+    "depthsnap_receipt_to_dispatch_ms", "depthsnap_receipt_to_publication_ms",
+)
+PERCENTILES = ("p50", "p95", "p99")
 
 
 def digest(obj):
@@ -185,7 +192,7 @@ def build_packet(database, session, *, through_id=None, diagnostic=None, checkpo
     metadata = {"software_sha": sha, "source": source["source"], "contract": {
         "exchange": "COMEX", "symbol": symbol, "expiry": expiry}}
     recorded_cal = calendar_sha if isinstance(calendar_sha, str) and DIGEST.fullmatch(calendar_sha) else None
-    return {
+    packet = {
         "schema": SCHEMA, "schema_version": VERSION, "capture": {
             **metadata, "session_id": session, "first_record_id": first, "durable_position": position,
             "records": count, "prefix_sha256": prefix_digest.hexdigest(), "mode": mode,
@@ -211,6 +218,44 @@ def build_packet(database, session, *, through_id=None, diagnostic=None, checkpo
         "operator": operator_summary(diagnostic, metadata, session, position, event_counts, schema_snapshot),
         "field_gates": {"real_gateway": "UNVERIFIED", "real_depth_entitlement": "UNVERIFIED", "real_capture": "UNVERIFIED"},
     }
+    # New captures attest these fields at startup. Keep verification compatible
+    # with existing v1 packets generated from earlier capture metadata.
+    if "requested_mode" in config:
+        requested = config["requested_mode"]
+        rights = config.get("retention_basis")
+        expiry_basis = config.get("expiry_basis")
+        synthetic = source["source"] == "fxaurum_mock"
+        if (requested not in ("A", "B", "C")
+                or rights not in (("SYNTHETIC",) if synthetic else ("UNVERIFIED", "OPERATOR_ATTESTED"))
+                or expiry_basis not in (("UNVERIFIED",) if synthetic else ("UNVERIFIED", "OPERATOR_ATTESTED"))
+                or (diagnostic is not None and diagnostic["requested_mode"] != requested)):
+            raise ValueError("Unsupported capture or operator declarations")
+        summary = capture_summary or {}
+        report = diagnostic or {}
+        receiver = summary.get("receiver") or report.get("receiver", {})
+        packet["capture"].update({
+            "requested_mode": requested, "effective_mode": schema_snapshot["mode"],
+            "retention_basis": rights, "expiry_basis": expiry_basis,
+        })
+        packet["coverage"]["interval_counts"] = {
+            "transport_and_restart": gaps["gap"] + gaps["restart_gap"],
+            "mbp_detected": gaps["mbp_gap"], "mbp_recovered": gaps["mbp_recovery"],
+        }
+        packet["coverage"]["retained_durations_seconds"] = numeric_fields(
+            summary, ("observed_coverage_seconds_retained", "gap_seconds_retained")
+        )
+        packet["durability"].update({
+            "receiver": numeric_fields(receiver, RECEIVER_TOTALS),
+            "queue_residence_us": numeric_fields(receiver.get("queue_residence_us") or {}, PERCENTILES),
+            "commit_latency_us": numeric_fields(
+                summary.get("recorder", {}).get("observation_to_commit_us") or report.get("commit_latency_us") or {},
+                PERCENTILES,
+            ),
+            "publication_latency_us": numeric_fields(
+                summary.get("publication_latency_us") or report.get("publication_latency_us") or {}, PERCENTILES
+            ),
+        })
+    return packet
 
 
 def verify_packet(packet, database, *, diagnostic=None, checkpoint=None):

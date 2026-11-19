@@ -12,6 +12,7 @@ from observatory.diagnose import diagnostic
 from observatory.evidence import build_packet, verify_packet
 from observatory.events import MOCK_GC
 from observatory.mock_gateway import MockGateway
+from observatory.pilot import build_report
 from observatory.web import create_app
 
 
@@ -44,14 +45,28 @@ def test_sanitized_attested_evidence_packet_on_real_socket(tmp_path):
         assert packet["replay"]["checkpoint_parity"] == "PASS"
         assert packet["coverage"]["gap_markers"]["mbp_gap"] == 1
         assert packet["coverage"]["rpc_outcomes"]["SNAPSHOT_APPLIED"] == 1
+        assert packet["capture"]["retention_basis"] == "SYNTHETIC"
+        assert packet["capture"]["requested_mode"] == packet["capture"]["effective_mode"] == "C"
+        assert packet["durability"]["receiver"]["visible_market_frames"] == diag["receiver"]["visible_market_frames"]
         assert packet["field_gates"] == {gate: "UNVERIFIED" for gate in
                                          ("real_gateway", "real_depth_entitlement", "real_capture")}
         assert verify_packet(packet, database, diagnostic=diag, checkpoint=snapshot)["checkpoint_parity"] == "PASS"
+        field = build_report(diag, "a" * 32, diag["git_sha"], "b" * 64, authorized=True,
+                             packet=packet, database=database, checkpoint=snapshot)
+        assert field["replay_verification"]["checkpoint_parity"] == "PASS"
+        assert field["pilot_result_scope"] == "SYNTHETIC_TESTED"
+        assert field["independent_field_verification"] == "UNVERIFIED"
+        assert field["capture_rights_status"] == "NOT_APPLICABLE"
+        assert "do not export" not in json.dumps(field)
         serialized = json.dumps(packet)
         assert "price_ticks" not in serialized and "do not export" not in serialized
 
         counterfeit = deepcopy(packet)
         counterfeit["field_gates"]["real_gateway"] = "PASS"
+        with pytest.raises(ValueError, match="does not match"):
+            verify_packet(counterfeit, database, diagnostic=diag, checkpoint=snapshot)
+        counterfeit = deepcopy(packet)
+        del counterfeit["replay"]["state_sha256"]
         with pytest.raises(ValueError, match="does not match"):
             verify_packet(counterfeit, database, diagnostic=diag, checkpoint=snapshot)
         bad_diag = deepcopy(diag)

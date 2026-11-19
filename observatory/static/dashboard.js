@@ -138,8 +138,11 @@ function update(snapshot) {
   const { status, trade, bbo } = snapshot;
   const tickSize = Number(status.tick_size);
   show("source", status.mode === "LIVE" ? "LIVE / FXAURUM" : "MOCK / SYNTHETIC");
+  document.getElementById("source").dataset.source = status.mode;
   show("instrument", status.exchange + " · " + status.symbol +
-    (status.expiry ? " · expiry " + status.expiry : " · simulated clock") + " (UTC)");
+    (status.expiry ? " · expiry " + status.expiry +
+      (status.expiry_attestation === "OPERATOR_ATTESTED" ? " · operator attested" : " · unverified")
+      : " · simulated clock") + " (UTC)");
   show("last-volume", received(status.last_volume_update));
   const recorder = status.recorder;
   const quality = status.quality;
@@ -149,6 +152,11 @@ function update(snapshot) {
   show("ops-capture", status.recorder_error ? "FAILED · historical data only" : recorder.enabled ?
     recorder.average_records_per_second.toFixed(0) + " records/s · backlog " +
       recorder.backlog_records + " · peak " + recorder.high_water_records : "CAPTURE OFF");
+  show("ops-storage", recorder.enabled ?
+    recorder.storage_status + " · durable #" + (recorder.durable_position ?? "—") : "CAPTURE OFF");
+  show("ops-depth", "MBP " + (quality.missing_sources.includes("mbp") ? "NOT READY" : status.mbp_status) +
+    " · DBO " + status.mbo_entitlement +
+    (quality.missing_sources.includes("mbo") ? " · awaiting fresh events" : ""));
   const latencies = recorder.observation_to_commit_us;
   show("ops-latency", latencies?.p95 != null ? "p50 " + (latencies.p50 / 1000).toFixed(1) +
     " · p95 " + (latencies.p95 / 1000).toFixed(1) + " · p99 " + (latencies.p99 / 1000).toFixed(1) + " ms" : "UNAVAILABLE");

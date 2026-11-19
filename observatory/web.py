@@ -1,10 +1,12 @@
 """Loopback FastAPI app wired to the synthetic gateway and collector."""
 
 import asyncio
+import json
 import platform
+import re
 from functools import lru_cache
 import subprocess
-from contextlib import AsyncExitStack, asynccontextmanager, suppress
+from contextlib import AsyncExitStack, asynccontextmanager
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect
@@ -26,9 +28,16 @@ STATIC = Path(__file__).with_name("static")
 
 @lru_cache(maxsize=1)
 def software_revision():
+    root = STATIC.parent.parent
+    manifest = root / "RELEASE.json"
+    if manifest.is_file():
+        revision = json.loads(manifest.read_text(encoding="utf-8"))["source_sha"]
+        if not re.fullmatch(r"[0-9a-f]{40}", revision):
+            raise ValueError("Invalid packaged software revision")
+        return revision
     try:
         output = subprocess.check_output(
-            ["git", "rev-parse", "HEAD"], cwd=STATIC.parent.parent,
+            ["git", "rev-parse", "HEAD"], cwd=root,
             stderr=subprocess.DEVNULL, text=True, timeout=2,
         ).strip()
     except (OSError, subprocess.SubprocessError):
@@ -43,6 +52,8 @@ def create_app(
     stale_after: float = 3.0, mode: str = "A", mbo_entitled: bool = False,
     mock_gateway: MockGateway | None = None, batch_size: int = 32,
     calendar: SessionCalendar | None = None,
+    expiry_attested: bool = False, retention_attested: bool = False,
+    mock_mbo_available: bool = True, mock_cycles: int | None = None,
 ) -> FastAPI:
     if not 1 <= batch_size <= 64:
         raise ValueError("Capture batch size must be 1–64")
@@ -50,7 +61,7 @@ def create_app(
     if mode not in ("A", "B", "C"):
         raise ValueError("Unknown market data mode")
     requested_mode = mode
-    if live and mode == "C" and not mbo_entitled:
+    if mode == "C" and (not mbo_entitled if live else not mock_mbo_available):
         mode = "B"
     instrument_registry = registry(instrument, calendar)
     state = ObservatoryState(instrument, stale_after=stale_after, live=live)
@@ -60,7 +71,9 @@ def create_app(
         "measurement_schema_version": 4, "stale_after_ns": state.stale_after_ns,
         "software_revision": software_revision(), "producer_os": platform.system(), "instrument_registry": instrument_registry,
         "timestamp_contract": "utc_ns and process monotonic_ns; source clocks per instrument contract",
-        "capture_config": {"mode": mode, "batch_size": batch_size, "durability": "SQLite WAL FULL",
+        "capture_config": {"mode": mode, "requested_mode": requested_mode, "batch_size": batch_size, "durability": "SQLite WAL FULL",
+                           "retention_basis": ("OPERATOR_ATTESTED" if retention_attested else "UNVERIFIED") if live else "SYNTHETIC",
+                           "expiry_basis": "OPERATOR_ATTESTED" if live and expiry_attested else "UNVERIFIED",
                            "retention_days": retention_days, "batch_residence_ms": 4},
         "protocol_revision": "581cb6b3706c93ccd1667b32234e904654a44728",
     }, retention_days, batch_size=batch_size) if capture_path is not None else None
@@ -81,16 +94,24 @@ def create_app(
             if live:
                 endpoint = f"ws://127.0.0.1:{live_gateway_port}/"
             else:
-                gateway = mock_gateway or MockGateway(instrument, interval, disconnect_after, mode=mode)
+                gateway = mock_gateway or MockGateway(instrument, interval, disconnect_after, mode=mode, tape_cycles=mock_cycles)
                 endpoint = await stack.enter_async_context(gateway.running())
             app.state.collector = Collector(endpoint, state, journal=journal, micro=micro, session_calendar=calendar)
             collector = asyncio.create_task(app.state.collector.run())
             try:
                 yield
             finally:
-                collector.cancel()
-                with suppress(asyncio.CancelledError):
-                    await collector
+                try:
+                    if not collector.done():
+                        async with asyncio.timeout(12):
+                            await app.state.collector.stop()
+                            await collector
+                    else:
+                        await collector
+                finally:
+                    if not collector.done():
+                        collector.cancel()
+                        await asyncio.gather(collector, return_exceptions=True)
                 if journal and not journal.publication_failed:
                     now = Observation.now()
                     ended = state.status(now)
@@ -102,6 +123,8 @@ def create_app(
                     conclusion["recorder"] = journal.diagnostics(now.monotonic_ns)
                     conclusion["committed_market_records"] = journal.market_records
                     conclusion["effective_mode"] = micro.mode
+                    conclusion["requested_mode"] = requested_mode
+                    conclusion["publication_latency_us"] = micro.snapshot(now)["diagnostics"].get("observation_to_availability_us")
                     await journal.append("capture_summary", now.utc_ns, conclusion)
 
     async def current_snapshot(*, full: bool) -> dict:
@@ -129,6 +152,7 @@ def create_app(
         status["receiver"] = agent.receiver_diagnostics()
         status["market_data_mode"] = micro.mode
         status["requested_market_data_mode"] = requested_mode
+        status["expiry_attestation"] = "OPERATOR_ATTESTED" if live and expiry_attested else "UNVERIFIED"
         status["mbp_status"] = "INVALID" if failed else micro.depth.state if micro.depth else "DISABLED"
         status["mbo_entitlement"] = micro.entitlement
         source_micro = Microstructure(mode, instrument, source_state.source) if failed else micro
@@ -191,10 +215,18 @@ def create_app(
                       limit: int = Query(100, ge=1, le=250), gaps: bool = False):
         if journal is None:
             raise HTTPException(404, "Local capture is disabled")
+        if live and not gaps:
+            raise HTTPException(403, "LIVE history is limited to the gap timeline; use local replay for capture data")
         try:
             records = await journal.io(journal.history, after, limit, gaps=gaps)
         except JournalError:
             raise HTTPException(503, "Local capture is unavailable") from None
+        if live:
+            records = [{
+                **{key: row[key] for key in ("schema_version", "id", "utc_ns", "kind")},
+                "payload": {key: row["payload"][key] for key in ("reason", "from_utc_ns") if key in row["payload"]},
+                "provenance": {key: row["provenance"][key] for key in ("symbol", "source")},
+            } for row in records]
         return {"records": records}
 
     @app.websocket("/ws")

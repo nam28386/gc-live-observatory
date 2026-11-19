@@ -1,16 +1,28 @@
-param([int]$GatewayPort = 9001, [int]$Port = 8000, [switch]$Running)
+param(
+    [ValidateRange(1,65535)][int]$GatewayPort = 9001,
+    [ValidateRange(1,65535)][int]$Port = 8000,
+    [switch]$Running,
+    [switch]$Synthetic
+)
 $ErrorActionPreference = 'Stop'
-function Confirm-Loopback([int]$ListenerPort) {
-    $listeners = @(Get-NetTCPConnection -State Listen -LocalPort $ListenerPort -ErrorAction SilentlyContinue)
-    if (!$listeners -or ($listeners | Where-Object { $_.LocalAddress -notin @('127.0.0.1', '::1') })) {
-        throw "Port $ListenerPort requires a loopback-only listener"
+function Get-Listeners([int]$ListenerPort) {
+    [System.Net.NetworkInformation.IPGlobalProperties]::GetIPGlobalProperties().GetActiveTcpListeners() |
+        Where-Object Port -eq $ListenerPort
+}
+function Confirm-Loopback([int]$ListenerPort, [string]$Service) {
+    $listeners = @(Get-Listeners $ListenerPort)
+    if (!$listeners) { throw "$Service is absent on port $ListenerPort. Check that it is running and verify the port." }
+    if ($listeners | Where-Object { $_.Address.ToString() -notin @('127.0.0.1', '::1') }) {
+        throw "$Service port $ListenerPort has a non-loopback listener. Bind it to 127.0.0.1."
     }
-    if (!(Test-NetConnection 127.0.0.1 -Port $ListenerPort -InformationLevel Quiet)) {
-        throw "IPv4 loopback port $ListenerPort is unreachable"
+    if (!($listeners | Where-Object { $_.Address.ToString() -eq '127.0.0.1' })) {
+        throw "$Service port $ListenerPort has no IPv4 loopback listener."
     }
 }
-Confirm-Loopback $GatewayPort
-if ($Running) { Confirm-Loopback $Port }
-elseif (Get-NetTCPConnection -State Listen -LocalPort $Port -ErrorAction SilentlyContinue) {
-    throw "Dashboard port $Port is already in use"
+
+if (!$Synthetic) {
+    if ($GatewayPort -eq $Port) { throw 'Gateway and dashboard ports must differ.' }
+    Confirm-Loopback $GatewayPort 'Fxaurum gateway'
 }
+if ($Running) { Confirm-Loopback $Port 'Dashboard' }
+elseif (Get-Listeners $Port) { throw "Dashboard port $Port is already in use." }
