@@ -57,3 +57,18 @@ To test local capture after confirming retention rights, use `-Capture -BatchSiz
 `-Calendar <local JSON>` uses operator-sourced COMEX GC intervals. Use schema version 1, `exchange: COMEX`, `product: GC`, `exchange_timezone: America/New_York`, `version`, `provenance`, explicit UTC `coverage_start` and `coverage_end`, and an ordered `open_sessions` array of `id`, `open` and `close`. Verify coverage against the [CME product specification](https://www.cmegroup.com/markets/metals/precious/gold.contractSpecs.html) and [holiday schedule](https://www.cmegroup.com/tools-information/holiday-calendar.html). The app returns `UNKNOWN` when there is no calendar coverage or the source is Mock. Expiry and roll selection remain explicit operator inputs.
 
 Real Windows gateway, MBP and DBO remain **UNVERIFIED** until the local pilot is run.
+
+## Phase 04 commissioning
+
+Use the existing run-live and smoke scripts in separate terminals. Validate A first, then B. Only try C after a positive local `mbo-probe`. Check COMEX, symbol and expiry against the authorized gateway and exchange reference before passing the optional expiry-attestation flag.
+
+```powershell
+.\scripts\windows\run-live.ps1 -Symbol $Symbol -Expiry $Expiry -Mode A
+.\scripts\windows\smoke.ps1 -Symbol $Symbol -Expiry $Expiry -Mode A
+uv run --locked python -m observatory.diagnose --port 8000 --gateway-port 9001 --require-mode A --wait-seconds 30 --expiry-verified
+.\scripts\windows\stop.ps1
+```
+
+For B, substitute `-Mode B` and `--require-mode B`. The smoke script now requires a valid OFI window in addition to MBP progress. For C, use `-Mode C -MboEntitled` only after a positive probe, then `--require-mode C`. An absence of DBO entitlement leaves A/B usable. Compare the reported exact and inferred counts without requiring an inferred fill to occur. The probe status in a report is an operator assertion, with observed stream readiness reported separately.
+
+Add `-Capture -BatchSize 32` only after confirming rights. Review queue pressure, uncertain receipt counts, p95/p99 commit and publication latency, and all three depthSnap timing intervals. `--output` can write the sanitized diagnostic to a new private path outside Git. Never include raw event payloads in pilot evidence. Verify loopback stop behavior and retain the report and exact SHA separately from licensed data.

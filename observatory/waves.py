@@ -193,6 +193,7 @@ def research_object(wave, evidence):
             "event_id": item["id"], "prediction": item.get("prediction"), "outcome": item.get("label"),
         } for item in linked],
         "data_quality": last["validity"], "confidence_limitations": last["uncertainty"],
+        "contradictory_evidence": last["contradictory_evidence"],
         "epistemic": {
             "FACT": ["Contract and recorded source identifiers"],
             "MEASUREMENT": [item["trigger"] for item in wave["transitions"]],
@@ -201,7 +202,7 @@ def research_object(wave, evidence):
                            "Persistent execution", "Inventory-sensitive quoting"],
             "UNKNOWN": ["Calibrated reference response", "Participant identity", "Causal mechanism"]
                        + origin.get("missing_evidence", []),
-            "REJECTED": last["contradictory_evidence"],
+            "REJECTED": [],
         },
         "falsifiers": [last["falsifier"]], "supersession": [], "timeline": wave["transitions"],
     }

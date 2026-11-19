@@ -234,8 +234,10 @@ class Collector:
                     frame = Received(raw, loop.time(), Observation.now())
                     if queue.full():
                         self.receive_pressure += 1
-                    async with asyncio.timeout(RECEIVE_PRESSURE_TIMEOUT):
-                        await queue.put(frame)
+                        async with asyncio.timeout(RECEIVE_PRESSURE_TIMEOUT):
+                            await queue.put(frame)
+                    else:
+                        queue.put_nowait(frame)
                     admitted += 1
                     self.receive_high_water = max(self.receive_high_water, queue.qsize())
             except TimeoutError:

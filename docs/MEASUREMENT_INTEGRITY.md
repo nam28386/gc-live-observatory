@@ -33,3 +33,23 @@ The observation starts on an eligible signed-flow burst and stores the pre-event
 An event after the cutoff materializes the record and the journal records its actual availability separately. The `t0+30s` label is first materialized only after observation passes the horizon and uses the last sufficiently fresh mid at or before the horizon. Transport interruption, MBP reinitialization, sequence gaps, stale coverage or invalid BBO exclude the window. A recovery never changes the eligibility of an earlier failed window. Replay consumes a selected session in durable order with timestamp and sample bounds. It requires an intact retained prefix for parity.
 
 The scientific result remains **UNRESOLVED**. Cross-stream timing, hidden liquidity, trade-side classification and common causes limit identification. No actor, profitability or causal inference is established.
+
+## Phase 04 wave and response contract
+
+Wave classification is a receive-time observation over the existing feature engine. Observe eligible trade flow, BBO displacement and MBP coverage. The opening observation copies only candle fields known at that point and records whether the candle is forming or closed as of receipt. H1/M15/M5/M1 have separate horizons and may link to a compatible observed parent. A missing M1 bucket, known session change or coverage interruption invalidates affected active classifications. The old transition remains in the history.
+
+| State | Observable threshold in observed-wave-v1 |
+| --- | --- |
+| Initiation candidate | Existing one-second signed-flow burst and a fresh quoted midpoint |
+| Propagation observed | Mid displaced at least two ticks in the signed-flow direction |
+| Acceptance candidate | Later observed quote retains at least two ticks of displacement after the horizon-specific confirmation delay |
+| Stall observed | Confirmation window observed without two ticks of displacement |
+| Exhaustion candidate | Two ticks of observed decay from the observed directional peak |
+| Reversal observed | Opposing displacement of at least two ticks relative to the initiation anchor |
+| Invalidated or ended | Lost coverage, verified session boundary, new observed exchange candle or elapsed horizon |
+
+The quote sample triggers are observations. They do not determine continuity between quotes, identify a market participant, or classify a final swing using future prices. Mode A can record partial waves without MBP. A recorded transition becomes visible after the same durable publication boundary as its input. Raw journal receipt timestamps are distinct from exchange source times.
+
+Canonical objects keep facts, measurements, hypotheses and missing evidence separate. Contradictory observations do not become proof that a particular actor mechanism is rejected. The bounded dashboard index shows `EXPECTED_RESPONSE_UNAVAILABLE` and a null residual without an eligible empirical reference. Hypotheses such as passive replenishment, ordinary price discovery and cross-stream timing remain alternatives.
+
+H-GC-001 extraction preserves the complete candidate population ledger, including excluded candidates. Offline inputs are constrained by the original +2 s cutoff and their observed sample times. Materialization is separate from consumer visibility. An after-cutoff record is marked `AFTER_CUTOFF`; a publication time that was not individually attested remains null. The locked evaluation uses training-only standardization and fixed ridge penalty. Baseline, anchored-refill and opposite-side-control models share the same rows. The primary metric is paired MSE difference on the purged chronological session holdout. A single holdout session leaves interval uncertainty unestimated. Synthetic fixtures exercise mechanics only. The scientific status remains `UNRESOLVED`.

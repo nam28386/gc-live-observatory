@@ -58,3 +58,11 @@ uv run --locked python -m scripts.benchmark_phase03 --mode B --cycles 2000 --bat
 ```
 
 Use the session and position reported in `GET /api/snapshot` for `observatory.replay <db> <session> --through-id <id> --strict`. Use `observatory.dataset <db> <new-output-directory> --session <id>` to extract H-GC-001 engineering candidates. An input using legacy or pruned capture data is rejected in strict mode. See the [Phase 03 evidence and contracts](docs/PHASE03_EVIDENCE.md) and [Windows operator procedures](docs/WINDOWS_LIVE_VALIDATION.md).
+
+## Phase 04 commissioning and wave research
+
+Start the synthetic dashboard with `uv run --locked python -m observatory mock --mode C`. The intraday wave panel shows the observed H1 → M15 → M5 → M1 hierarchy. The investigator reads the bounded, local `GET /api/research` endpoint for wave and event records. An absent calibrated reference is reported as `EXPECTED_RESPONSE_UNAVAILABLE`.
+
+After extracting a strict local H-GC-001 dataset, run `uv run --locked python -m observatory.evaluate <dataset-directory>` to check eligibility and provenance. Only use `--confirm-permitted-data` with data permitted for empirical evaluation. The handler refuses mock datasets and locks a successful holdout evaluation in that directory.
+
+The [commissioning guide](docs/WINDOWS_LIVE_VALIDATION.md) covers the local physical checks. [Phase 04 evidence](docs/PHASE04_EVIDENCE.md) records synthetic and remote verification separately.

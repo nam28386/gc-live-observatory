@@ -62,6 +62,7 @@ def test_wave_observes_price_tape_and_never_relabels_prior_transition(tape, expe
     assert research["expected_response"]["status"] == "EXPECTED_RESPONSE_UNAVAILABLE"
     assert research["residual"] is None
     assert research["epistemic"]["INFERENCE"] == []
+    assert research["epistemic"]["REJECTED"] == []
 
 
 def test_hierarchy_is_as_of_forming_and_delayed_trade_cannot_change_wave():
