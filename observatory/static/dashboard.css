@@ -1,0 +1,55 @@
+:root {
+  color-scheme: dark;
+  --background: #121619;
+  --surface: #1a2024;
+  --text: #ebeee9;
+  --muted: #a9b4b8;
+  --line: #343f44;
+  --gold: #f0c577;
+  --green: #79d4b1;
+  --red: #ef988b;
+  font-family: system-ui, sans-serif;
+  font-variant-numeric: tabular-nums;
+}
+* { box-sizing: border-box; }
+body { margin: 0; color: var(--text); background: var(--background); }
+main { margin: auto; max-width: 1440px; padding: 28px clamp(12px, 4vw, 46px); }
+.top, .chart header { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+h1, h2, p { margin: 0; }
+h1 { font-size: clamp(23px, 4vw, 34px); font-weight: 650; letter-spacing: -.035em; }
+#instrument, #delivery, .market-value span, .diagnostics span { color: var(--muted); font-size: .82rem; }
+#instrument { margin-top: 4px; }
+.top-status { display: grid; gap: 5px; justify-items: end; text-align: right; }
+.mock { color: var(--gold); font-size: .74rem; font-weight: 700; letter-spacing: .075em; white-space: nowrap; }
+.market, .diagnostics {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  padding: 14px 0;
+  margin: 16px 0 12px;
+  gap: 12px;
+  border-block: 1px solid var(--line);
+}
+.market-value, .diagnostics > div { display: grid; align-content: start; gap: 5px; }
+.market-value strong { font-size: clamp(.84rem, 2vw, 1.35rem); font-weight: 600; }
+.charts { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
+.chart {
+  min-width: 0;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--surface);
+  overflow: hidden;
+}
+.chart header { min-height: 42px; padding: 8px 12px; border-bottom: 1px solid var(--line); }
+.chart h2 { color: var(--gold); font-size: .85rem; }
+.chart output { color: var(--muted); font-size: .76rem; text-align: right; }
+canvas { width: 100%; height: clamp(150px, 23vh, 260px); display: block; }
+.diagnostics { grid-template-columns: repeat(5, minmax(0, 1fr)); }
+.diagnostics output { font-size: .78rem; overflow-wrap: anywhere; }
+.diagnostics .warning { color: var(--gold); }
+@media (max-width: 760px) {
+  .diagnostics, .market { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
+@media (max-width: 560px) {
+  .charts { grid-template-columns: 1fr; }
+  main { padding-top: 18px; }
+}

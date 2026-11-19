@@ -1,0 +1,23 @@
+[project]
+name = "gc-live-observatory"
+version = "0.2.0"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "fastapi>=0.115,<1",
+    "uvicorn>=0.34,<1",
+    "websockets>=15,<17",
+]
+
+[dependency-groups]
+dev = [
+    "httpx2>=2,<3",
+    "playwright>=1.51,<2",
+    "pytest>=8,<10",
+    "pytest-asyncio>=0.26,<2",
+]
+
+[tool.pytest.ini_options]
+asyncio_mode = "strict"
+asyncio_default_fixture_loop_scope = "function"
+testpaths = ["tests"]
+markers = ["browser: requires an installed Chromium for the real dashboard smoke test"]

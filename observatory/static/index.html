@@ -1,0 +1,51 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>GC Live Observatory | MOCK</title>
+  <link rel="stylesheet" href="/static/dashboard.css">
+  <script src="/static/dashboard.js" defer></script>
+</head>
+<body>
+  <main>
+    <header class="top">
+      <div>
+        <h1>GC Live Observatory</h1>
+        <p id="instrument">COMEX gold futures</p>
+      </div>
+      <div class="top-status">
+        <span class="mock">MOCK / SYNTHETIC</span>
+        <output id="delivery" aria-live="polite">Connecting to dashboard stream</output>
+      </div>
+    </header>
+
+    <section class="market" aria-label="Market observations">
+      <div class="market-value"><span>Last trade</span><strong id="trade">—</strong></div>
+      <div class="market-value"><span>Bid × ask</span><strong id="quote">—</strong></div>
+      <div class="market-value"><span>Spread</span><strong id="spread">—</strong></div>
+      <div class="market-value"><span>Observed CVD</span><strong id="cvd">—</strong></div>
+    </section>
+
+    <section class="charts" aria-label="Observed trade candles (UTC)">
+      <article class="chart" data-frame="M1"><header><h2>M1</h2><output>Awaiting trade</output></header><canvas aria-label="M1 candle chart"></canvas></article>
+      <article class="chart" data-frame="M5"><header><h2>M5</h2><output>Awaiting trade</output></header><canvas aria-label="M5 candle chart"></canvas></article>
+      <article class="chart" data-frame="M15"><header><h2>M15</h2><output>Awaiting trade</output></header><canvas aria-label="M15 candle chart"></canvas></article>
+      <article class="chart" data-frame="H1"><header><h2>H1</h2><output>Awaiting trade</output></header><canvas aria-label="H1 candle chart"></canvas></article>
+    </section>
+
+    <section class="diagnostics" aria-label="Capture diagnostics">
+      <div><span>Collector socket</span><output id="transport">—</output></div>
+      <div><span>Subscribe ACK</span><output id="ack">—</output></div>
+      <div><span>Trade / BBO freshness</span><output id="freshness">—</output></div>
+      <div><span>Capture coverage</span><output id="coverage">Partial session · observed only</output></div>
+      <div><span>Last message received</span><output id="last-message">—</output></div>
+      <div><span>Last eligible trade observed</span><output id="last-trade">—</output></div>
+      <div><span>Last BBO message observed</span><output id="last-bbo">—</output></div>
+      <div><span>Last BBO price/size change observed</span><output id="last-bbo-change">—</output></div>
+      <div><span>Last OI update observed</span><output id="last-oi">—</output></div>
+      <div><span>Capture gaps</span><output id="gaps">—</output></div>
+    </section>
+  </main>
+</body>
+</html>
