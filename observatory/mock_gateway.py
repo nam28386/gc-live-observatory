@@ -17,7 +17,7 @@ TRADE_STEP_MS = 43_000
 
 class MockGateway:
     def __init__(
-        self, instrument: Instrument, interval: float = 0.16, disconnect_after: int | None = None, *, mode: str = "A"
+        self, instrument: Instrument, interval: float = 0.16, disconnect_after: int | None = None, *, mode: str = "A", tape_cycles: int | None = None
     ) -> None:
         self.instrument = instrument
         self.interval = interval
@@ -28,6 +28,7 @@ class MockGateway:
         self.generation = 0
         self.seq = 0
         self.ask_size = 10
+        self.tape_cycles = tape_cycles
 
     @property
     def streams(self):
@@ -119,7 +120,7 @@ class MockGateway:
                 await self.send(socket, self.streams[3], {"type": "Image", "oid": "seed",
                                 "p": 2750.1, "side": "S", "q": 4, "pri": "31", "k": 0, "ki": 0})
             initial_index = self.index
-            while True:
+            while self.tape_cycles is None or self.index < self.tape_cycles:
                 await asyncio.sleep(self.interval)
                 index = self.index
                 self.index += 1
@@ -154,6 +155,7 @@ class MockGateway:
                     self.index += 2
                     await socket.close(code=1012, reason="synthetic reconnect exercise")
                     return
+            await socket.wait_closed()
         except ConnectionClosed:
             return
 

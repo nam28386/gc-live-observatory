@@ -1,7 +1,7 @@
 """Collect and normalize the allowlisted Trade/BBO WebSocket streams."""
 
 import asyncio
-from collections import Counter
+from collections import Counter, deque
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, replace
 from decimal import Decimal, DecimalException
@@ -16,6 +16,7 @@ from .books import parse_depth, parse_order, stream_payload
 from .microstructure import Microstructure
 from .events import Observation, ParseError, Trade, WrongInstrument, parse_event
 from .state import ObservatoryState
+from .rpc import SnapshotRPC, SnapshotRequest
 from .journal import Journal, JournalError
 
 MAX_MESSAGE_BYTES = 512 * 1024
@@ -66,6 +67,15 @@ class Collector:
         self.retry_delay = retry_delay
         self.ack_timeout = ack_timeout
         self.next_request_id = 0
+        self.connection_epoch = 0
+        self.rpc = SnapshotRPC()
+        self.rpc_transport_outcome = "RPC_TRANSPORT_INTERRUPTED"
+        self.received_frames = 0
+        self.admitted_frames = 0
+        self.queue_residence_ns = deque(maxlen=4096)
+        self.queue_arrivals = deque()
+        self.normalized_market_frames = 0
+        self.visible_market_frames = 0
         self.incoming_frames = 0
         self.decoded_frames = 0
         self.ingest_high_water_frames = 0
@@ -91,6 +101,7 @@ class Collector:
                     ping_interval=10, ping_timeout=10,
                 ) as socket:
                     self.next_request_id += 1
+                    self.connection_epoch += 1
                     self.state.on_connect(self.next_request_id)
                     await self.subscribe(socket, self.next_request_id)
                     delay = self.retry_delay
@@ -157,6 +168,8 @@ class Collector:
             self.micro.disconnect(observed)
             self.micro.last_time = observed.monotonic_ns
         capture_interrupted = acknowledged or reason in ("subscribe_buffer_overflow", "gateway_frame_overflow", "local_receive_backpressure")
+        if self.rpc.active:
+            await self.rpc_outcome("RPC_COMMIT_FAILURE" if self.state.recorder_error else self.rpc_transport_outcome)
         if capture_interrupted and self.journal and not self.state.recorder_error:
             await self.journal.append("gap", observed.utc_ns, {
                 "reason": reason, "request_id": self.state.request_id, "observed": observed.wire(),
@@ -177,6 +190,7 @@ class Collector:
                     raw = await socket.recv()
             except TimeoutError:
                 raise SubscriptionFailure("subscribe_ack_timeout") from None
+            self.received_frames += 1
             decoded = self.decode(raw)
             if decoded is None:
                 continue
@@ -232,13 +246,20 @@ class Collector:
                 while True:
                     raw = await socket.recv()
                     frame = Received(raw, loop.time(), Observation.now())
+                    self.received_frames += 1
+                    match = self.observe_rpc_receipt(frame)
                     if queue.full():
                         self.receive_pressure += 1
                         async with asyncio.timeout(RECEIVE_PRESSURE_TIMEOUT):
                             await queue.put(frame)
                     else:
                         queue.put_nowait(frame)
+                    if match is not None and self.rpc.active is match:
+                        match.queued = loop.time()
+                        self.rpc.mark("RESPONSE_QUEUED", match.queued)
+                    self.queue_arrivals.append(frame.clock)
                     admitted += 1
+                    self.admitted_frames += 1
                     self.receive_high_water = max(self.receive_high_water, queue.qsize())
             except TimeoutError:
                 self.uncertain_receipts += 1
@@ -263,18 +284,53 @@ class Collector:
                 raise item
             if isinstance(item, Received):
                 admitted -= 1
+                self.queue_arrivals.popleft()
+                self.queue_residence_ns.append(round((loop.time() - item.clock) * 1e9))
             return item
 
+        self.rpc_transport_outcome = "RPC_TRANSPORT_INTERRUPTED"
         reader = asyncio.create_task(receiver())
         try:
             await self.consume_market(socket, receive)
+        except SubscriptionFailure as exc:
+            if str(exc) == "local_receive_backpressure":
+                self.rpc_transport_outcome = "RPC_LOCAL_BACKPRESSURE"
+            raise
         finally:
             reader.cancel()
             await asyncio.gather(reader, return_exceptions=True)
             self.uncertain_receipts += admitted
+            self.queue_arrivals.clear()
+
+    def observe_rpc_receipt(self, packet):
+        request = self.rpc.active
+        raw = packet.frame
+        if request is None or not isinstance(raw, str) or '"id"' not in raw:
+            return None
+        try:
+            message = json.loads(raw)
+        except (ValueError, RecursionError):
+            return None
+        if (isinstance(message, dict) and "stream" not in message
+                and type(message.get("id")) is int and message["id"] == request.request_id
+                and request.received is None):
+            request.received = packet.clock
+            self.rpc.mark("RESPONSE_RECEIVED", packet.clock)
+            return request
+        return None
+
+    async def rpc_outcome(self, outcome, *, stage=None):
+        request = self.rpc.active
+        if request is None:
+            return
+        if stage:
+            self.rpc.mark(stage, asyncio.get_running_loop().time())
+        self.rpc.finish(outcome)
+        if self.journal and not self.journal.publication_failed:
+            stamp = Observation.now()
+            await self.journal.append("depth_rpc", stamp.utc_ns, self.rpc.recent[-1])
 
     async def consume_market(self, socket, receive):
-        pending = None
         recovery_key = None
         attempts = 0
         reset_deadline = None
@@ -288,27 +344,43 @@ class Collector:
                 elif depth.state != "SNAPSHOT_PENDING":
                     reset_deadline = None
                 key = depth.gen, depth.epoch
-                if key != recovery_key:
-                    pending, attempts, recovery_key = None, 0, key
-                if pending and depth.valid:
-                    pending = None
-                if depth.state in ("GAP_DETECTED", "RECOVERING", "OVERFLOW") and depth.gen is not None and pending is None:
+                if key != recovery_key or depth.valid:
+                    if self.rpc.active:
+                        await self.rpc_outcome("RPC_GENERATION_MISMATCH" if key != recovery_key
+                                               else "RPC_SUPERSEDED_BY_STREAM_IMAGE")
+                    if key != recovery_key:
+                        attempts, recovery_key = 0, key
+                if (depth.state in ("GAP_DETECTED", "RECOVERING", "OVERFLOW") and depth.gen is not None
+                        and self.rpc.active is None):
                     if attempts < 3:
                         attempts += 1
                         self.next_request_id += 1
                         request_id = self.next_request_id
                         await self.depth_control(depth, "RECOVERING")
-                        sent = loop.time()
+                        request = SnapshotRequest(request_id, self.connection_epoch, self.state.instrument.symbol,
+                                                  depth.gen, depth.epoch, loop.time(),
+                                                  pressure_at_send=self.receive_pressure, dispatch_budget=self.ack_timeout,
+                                                  publication_budget=self.ack_timeout)
+                        self.rpc.start(request)
+                        request.sent = loop.time()
+                        request.deadline = request.sent + self.ack_timeout
                         await socket.send(json.dumps({
                             "method": "depthSnap", "id": request_id,
                             "params": {"exchange": self.state.instrument.exchange, "symbol": self.state.instrument.symbol},
                         }))
-                        pending = request_id, sent + self.ack_timeout, sent
+                        self.rpc.mark("REQUEST_SENT", request.sent)
                     else:
+                        self.rpc.counts["RPC_RECOVERY_FAILED"] += 1
                         await self.depth_control(depth, "RECOVERY_FAILED", "retry_exhausted")
-            deadline = pending[1] if pending else reset_deadline
+            pending = self.rpc.active
+            deadline = pending.deadline if pending else reset_deadline
             try:
-                packet = carried if carried is not None else await receive(deadline)
+                # An already-received timely response may be waiting behind durable
+                # writes. Only its wire-time stamp, never dispatch time, decides expiry.
+                wait_deadline = deadline
+                if pending and pending.received is not None and pending.received <= deadline:
+                    wait_deadline = None
+                packet = carried if carried is not None else await receive(wait_deadline)
                 carried = None
                 if packet is None:
                     return
@@ -317,8 +389,9 @@ class Collector:
                     raise TimeoutError
             except TimeoutError:
                 if pending:
+                    pressured = self.receive_pressure != pending.pressure_at_send or len(self.queue_arrivals) >= RECEIVE_QUEUE
                     await self.depth_control(depth, increment="rpc_timeout")
-                    pending = None
+                    await self.rpc_outcome("RPC_LOCAL_BACKPRESSURE" if pressured else "RPC_RECEIPT_TIMEOUT")
                 elif reset_deadline is not None:
                     observed = Observation.now()
                     async with self.publication():
@@ -337,33 +410,75 @@ class Collector:
             payload, observed, raw = decoded
             if "stream" in payload:
                 if self.journal and self.journal.batch_size > 1:
-                    carried, closed = await self.process_market_batch(receive, decoded, gather=deadline is None)
+                    carried, closed = await self.process_market_batch(receive, decoded, deadline=deadline)
                     if closed:
                         return
                 else:
                     async with self.publication():
                         await self.process(*decoded)
-            elif pending and type(payload.get("id")) is int and payload["id"] == pending[0]:
-                self.recovery_receipt_ms = (packet.clock - pending[2]) * 1000
-                self.recovery_dispatch_ms = (loop.time() - packet.clock) * 1000
-                pending = None
-                try:
-                    data = payload.get("result")
-                    if ("error" in payload or payload.get("status", 200) != 200
-                        or not isinstance(data, dict) or data.get("type") != "Image"
-                        or ("s" in data and str(data["s"]).upper() != self.state.instrument.symbol)):
-                        raise ParseError("Unexpected depthSnap response")
-                    event = parse_depth(data, observed)
-                except (ParseError, DecimalException):
-                    await self.depth_control(depth, increment="invalid_rpc_response")
-                else:
-                    async with self.publication():
-                        await self.apply_book(event, "depth_snapshot", raw)
-                    self.recovery_publication_ms = (loop.time() - packet.clock) * 1000
+                    self.visible_market_frames = self.normalized_market_frames
+            elif pending and type(payload.get("id")) is int and payload["id"] == pending.request_id:
+                await self.handle_snapshot(depth, pending, packet, payload, observed, raw)
+            elif type(payload.get("id")) is int:
+                self.rpc.counts["UNMATCHED_RESPONSE"] += 1
+
+    async def handle_snapshot(self, depth, request, packet, payload, observed, raw):
+        loop = asyncio.get_running_loop()
+        self.rpc.mark("RESPONSE_RECEIVED", packet.clock)
+        self.rpc.mark("RESPONSE_QUEUED", packet.clock)
+        request.dispatched = loop.time()
+        self.rpc.mark("RESPONSE_DISPATCHED", request.dispatched)
+        self.recovery_receipt_ms = (packet.clock - request.sent) * 1000
+        self.recovery_dispatch_ms = (request.dispatched - packet.clock) * 1000
+        if request.dispatched > packet.clock + request.dispatch_budget:
+            request.outcomes.append("RPC_DISPATCH_DELAY")
+            self.rpc.counts["RPC_DISPATCH_DELAY"] += 1
+        try:
+            data = payload.get("result")
+            if ("error" in payload or payload.get("status", 200) != 200
+                    or not isinstance(data, dict) or data.get("type") != "Image"
+                    or ("s" in data and str(data["s"]).upper() != self.state.instrument.symbol)):
+                raise ParseError("Unexpected depthSnap response")
+            event = parse_depth(data, observed)
+        except (ParseError, DecimalException):
+            await self.depth_control(depth, increment="invalid_rpc_response")
+            await self.rpc_outcome("RPC_RESPONSE_INVALID")
+            return
+        if (event.gen != request.generation or event.gen != depth.gen
+                or request.recovery_epoch != depth.epoch or request.connection_epoch != self.connection_epoch):
+            await self.depth_control(depth, increment="generation_mismatch")
+            await self.rpc_outcome("RPC_GENERATION_MISMATCH")
+            return
+        self.rpc.mark("RESPONSE_VALIDATED", loop.time())
+        try:
+            async with self.publication():
+                await self.apply_book(event, "depth_snapshot", raw)
+        except JournalError:
+            self.rpc.finish("RPC_COMMIT_FAILURE")
+            raise
+        self.recovery_publication_ms = (loop.time() - packet.clock) * 1000
+        if self.journal:
+            request.committed = loop.time()
+            self.rpc.mark("RESPONSE_COMMITTED", request.committed)
+        if loop.time() > request.dispatched + request.publication_budget:
+            request.outcomes.append("RPC_PUBLICATION_DELAY")
+            self.rpc.counts["RPC_PUBLICATION_DELAY"] += 1
+        await self.rpc_outcome("SNAPSHOT_APPLIED" if depth.valid else "RPC_SEQUENCE_INSUFFICIENT",
+                               stage="SNAPSHOT_APPLIED" if depth.valid else None)
 
     def receiver_diagnostics(self):
+        samples = sorted(self.queue_residence_ns)
+        now = asyncio.get_running_loop().time() if self.queue_arrivals else None
         return {
             "incoming_frames": self.incoming_frames, "decoded_frames": self.decoded_frames,
+            "socket_received_frames": self.received_frames, "admitted_queue_frames": self.admitted_frames,
+            "normalized_market_frames": self.normalized_market_frames,
+            "visible_market_frames": self.visible_market_frames,
+            "receiver_queue_occupancy": len(self.queue_arrivals),
+            "oldest_queued_ms": (now - self.queue_arrivals[0]) * 1000 if now is not None else None,
+            "queue_residence_us": {f"p{p}": samples[(len(samples) - 1) * p // 100] / 1000 if samples else None
+                                   for p in (50, 95, 99)},
+            "depthsnap_rpc": self.rpc.view(),
             "ingest_high_water_frames": self.ingest_high_water_frames,
             "receive_queue_capacity": RECEIVE_QUEUE, "receive_queue_high_water": self.receive_high_water,
             "receive_pressure_count": self.receive_pressure, "uncertain_received_frames": self.uncertain_receipts,
@@ -382,22 +497,26 @@ class Collector:
                 stamp = Observation.now()
                 await self.journal.append("mbp_control", stamp.utc_ns, {
                     "state": depth.state, "increment": {increment: 1} if increment else {},
+                    "rpc_outcome": "RPC_RECOVERY_FAILED" if state == "RECOVERY_FAILED" else None,
                 })
 
-    async def process_market_batch(self, receive, first, *, gather):
+    async def process_market_batch(self, receive, first, *, deadline):
         frames = [first]
         carried = None
         closed = False
         end = asyncio.get_running_loop().time() + BATCH_RESIDENCE_SECONDS
         size = len(first[2].encode("utf-8"))
         try:
-            while gather and len(frames) < self.journal.batch_size and asyncio.get_running_loop().time() < end:
+            while len(frames) < self.journal.batch_size and asyncio.get_running_loop().time() < end:
                 try:
-                    packet = await receive(end)
+                    packet = await receive(min(end, deadline) if deadline is not None else end)
                 except TimeoutError:
                     break
                 if packet is None:
                     closed = True
+                    break
+                if deadline is not None and packet.clock > deadline:
+                    carried = packet
                     break
                 frame = packet.frame
                 decoded = self.decode(frame, track=False, observed=packet.observed)
@@ -417,6 +536,7 @@ class Collector:
                 for decoded in frames:
                     self.state.last_any = decoded[1]
                     await self.process(*decoded)
+        self.visible_market_frames = self.normalized_market_frames
         if self.micro:
             published = Observation.now().monotonic_ns
             self.micro.availability_ns.extend(published - row[1].monotonic_ns for row in frames)
@@ -433,6 +553,8 @@ class Collector:
                 "event_schema_version": 2, "event": event.wire(), "raw": raw,
                 "request_id": self.state.request_id,
             })
+        if kind in ("mbp", "mbo"):
+            self.normalized_market_frames += 1
         if kind == "mbo":
             self.micro.order_event(event)
         else:
@@ -566,6 +688,7 @@ class Collector:
                 await self.journal.append("trade" if trade else "bbo", observed.utc_ns, {
                     "event": event.wire(), "raw": frame, "request_id": self.state.request_id, "market_session": session,
                 }, coverage=coverage)
+            self.normalized_market_frames += 1
             if isinstance(event, Trade):
                 self.state.on_trade(event)
                 if self.micro and self.state.last_trade is event:

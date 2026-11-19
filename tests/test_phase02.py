@@ -9,6 +9,7 @@ from observatory.books import DepthBook, OrderBook, parse_depth, parse_order
 from observatory.events import MOCK_GC, Observation, ParseError, parse_event
 from observatory.microstructure import Microstructure, rank_ofi
 from observatory.web import create_app
+from observatory.mock_gateway import MockGateway
 
 
 def stamp(seconds=0):
@@ -177,7 +178,8 @@ def await_snapshot(client, predicate):
 
 @pytest.mark.parametrize("mode", ["A", "B", "C"])
 def test_actual_mock_websocket_to_api_with_modes_and_durable_recovery(mode, tmp_path):
-    with TestClient(create_app(mode=mode, interval=0.01, capture_path=tmp_path / "p2.sqlite")) as client:
+    with TestClient(create_app(mode=mode, mock_gateway=MockGateway(MOCK_GC, interval=.01, mode=mode, tape_cycles=13),
+                               capture_path=tmp_path / "p2.sqlite")) as client:
         def ready(data):
             micro = data["microstructure"]
             if not data["trade"]:
@@ -237,7 +239,8 @@ def test_replay_uses_durable_order_and_preserves_gap_after_recovery(tmp_path):
     from observatory.replay import replay
 
     database = tmp_path / "replay.sqlite"
-    with TestClient(create_app(mode="C", interval=0.01, capture_path=database)) as client:
+    with TestClient(create_app(mode="C", mock_gateway=MockGateway(MOCK_GC, interval=.01, mode="C", tape_cycles=13),
+                               capture_path=database)) as client:
         data = await_snapshot(client, lambda item: (
             item["microstructure"]["mbp"]["counts"].get("recoveries")
             and (item["microstructure"]["mbo"]["counts"] or {}).get("exact_fill")

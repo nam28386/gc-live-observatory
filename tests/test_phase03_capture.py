@@ -15,11 +15,14 @@ import pytest
 from observatory.journal import DAY_NS, Journal, JournalError
 from observatory.replay import observation, replay, semantic
 from observatory.web import create_app
+from observatory.events import MOCK_GC
+from observatory.mock_gateway import MockGateway
 
 
 def test_committed_prefix_semantically_matches_live_after_mbp_recovery_and_mbo(tmp_path):
     path = tmp_path / "parity.sqlite"
-    with TestClient(create_app(mode="C", interval=.015, capture_path=path)) as client:
+    with TestClient(create_app(mode="C", mock_gateway=MockGateway(MOCK_GC, interval=.015, mode="C", tape_cycles=13),
+                               capture_path=path)) as client:
         deadline = time.monotonic() + 12
         while True:
             live = client.get("/api/snapshot").json()
