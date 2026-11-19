@@ -3,7 +3,7 @@
 import asyncio
 from collections import Counter
 from contextlib import asynccontextmanager
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from decimal import Decimal, DecimalException
 import json
 from time import perf_counter_ns
@@ -20,6 +20,8 @@ from .journal import Journal, JournalError
 
 MAX_MESSAGE_BYTES = 512 * 1024
 MAX_QUEUE_FRAMES = 16
+RECEIVE_QUEUE = 64
+RECEIVE_PRESSURE_TIMEOUT = 4.0
 MAX_PRE_ACK_EVENTS = 32
 BATCH_RESIDENCE_SECONDS = 0.004
 MAX_BATCH_BYTES = 2 * 1024 * 1024
@@ -27,6 +29,13 @@ MAX_BATCH_BYTES = 2 * 1024 * 1024
 
 class SubscriptionFailure(Exception):
     pass
+
+
+@dataclass(frozen=True, slots=True)
+class Received:
+    frame: str | bytes
+    clock: float
+    observed: Observation
 
 
 class Collector:
@@ -59,6 +68,11 @@ class Collector:
         self.decoded_frames = 0
         self.ingest_high_water_frames = 0
         self.last_quality_sample_ns = None
+        self.receive_high_water = 0
+        self.receive_pressure = 0
+        self.recovery_receipt_ms = None
+        self.recovery_dispatch_ms = None
+        self.recovery_publication_ms = None
         self.freshness_samples = {key: Counter() for key in ("trade", "bbo", "mbp", "mbo")}
 
     async def run(self) -> None:
@@ -139,7 +153,7 @@ class Collector:
         if self.micro:
             self.micro.disconnect(observed)
             self.micro.last_time = observed.monotonic_ns
-        capture_interrupted = acknowledged or reason in ("subscribe_buffer_overflow", "gateway_frame_overflow")
+        capture_interrupted = acknowledged or reason in ("subscribe_buffer_overflow", "gateway_frame_overflow", "local_receive_backpressure")
         if capture_interrupted and self.journal and not self.state.recorder_error:
             await self.journal.append("gap", observed.utc_ns, {
                 "reason": reason, "request_id": self.state.request_id, "observed": observed.wire(),
@@ -201,6 +215,51 @@ class Collector:
         return base
 
     async def receive_market(self, socket):
+        # Socket receipt keeps progressing across recorder awaits. The consumer
+        # still applies every frame in original wire order, including RPC images.
+        queue = asyncio.Queue(RECEIVE_QUEUE)
+        loop = asyncio.get_running_loop()
+
+        async def receiver():
+            terminal = None
+            try:
+                while True:
+                    raw = await socket.recv()
+                    frame = Received(raw, loop.time(), Observation.now())
+                    if queue.full():
+                        self.receive_pressure += 1
+                    async with asyncio.timeout(RECEIVE_PRESSURE_TIMEOUT):
+                        await queue.put(frame)
+                    self.receive_high_water = max(self.receive_high_water, queue.qsize())
+            except TimeoutError:
+                terminal = SubscriptionFailure("local_receive_backpressure")
+            except ConnectionClosed as exc:
+                if not exc.rcvd or exc.rcvd.code not in (1000, 1001):
+                    terminal = exc
+            except OSError as exc:
+                terminal = exc
+            await queue.put(terminal)
+
+        async def receive(deadline=None):
+            if not queue.empty():
+                item = queue.get_nowait()
+            elif deadline is None:
+                item = await queue.get()
+            else:
+                async with asyncio.timeout_at(deadline):
+                    item = await queue.get()
+            if isinstance(item, Exception):
+                raise item
+            return item
+
+        reader = asyncio.create_task(receiver())
+        try:
+            await self.consume_market(socket, receive)
+        finally:
+            reader.cancel()
+            await asyncio.gather(reader, return_exceptions=True)
+
+    async def consume_market(self, socket, receive):
         pending = None
         recovery_key = None
         attempts = 0
@@ -212,21 +271,12 @@ class Collector:
             if depth:
                 if depth.state == "SNAPSHOT_PENDING" and reset_deadline is None:
                     reset_deadline = loop.time() + self.ack_timeout
-                if depth.state != "SNAPSHOT_PENDING":
-                    reset_deadline = None
-                elif loop.time() >= reset_deadline:
-                    observed = Observation.now()
-                    async with self.publication():
-                        depth.invalidate("snapshot_timeout", observed)
-                        if self.journal:
-                            await self.journal.append("mbp_gap", observed.utc_ns, depth.gaps[-1])
+                elif depth.state != "SNAPSHOT_PENDING":
                     reset_deadline = None
                 key = depth.gen, depth.epoch
                 if key != recovery_key:
                     pending, attempts, recovery_key = None, 0, key
-                if pending and (depth.valid or loop.time() >= pending[1]):
-                    if not depth.valid:
-                        await self.depth_control(depth, increment="rpc_timeout")
+                if pending and depth.valid:
                     pending = None
                 if depth.state in ("GAP_DETECTED", "RECOVERING", "OVERFLOW") and depth.gen is not None and pending is None:
                     if attempts < 3:
@@ -234,35 +284,36 @@ class Collector:
                         self.next_request_id += 1
                         request_id = self.next_request_id
                         await self.depth_control(depth, "RECOVERING")
+                        sent = loop.time()
                         await socket.send(json.dumps({
                             "method": "depthSnap", "id": request_id,
                             "params": {"exchange": self.state.instrument.exchange, "symbol": self.state.instrument.symbol},
                         }))
-                        pending = request_id, loop.time() + self.ack_timeout
+                        pending = request_id, sent + self.ack_timeout, sent
                     else:
                         await self.depth_control(depth, "RECOVERY_FAILED", "retry_exhausted")
-            prefetched = None
+            deadline = pending[1] if pending else reset_deadline
             try:
-                deadline = pending[1] if pending else reset_deadline
-                if carried is not None:
-                    (frame, prefetched), carried = carried, None
-                elif deadline is not None:
-                    frame = await asyncio.wait_for(socket.recv(), max(0, deadline - loop.time()))
-                else:
-                    frame = await socket.recv()
-            except TimeoutError:
-                continue
-            except ConnectionClosed as exc:
-                if exc.rcvd and exc.rcvd.code in (1000, 1001):
+                packet = carried if carried is not None else await receive(deadline)
+                carried = None
+                if packet is None:
                     return
-                raise
-            if prefetched is not None:
-                decoded = prefetched
-                self.state.last_any = decoded[1]
-                self.incoming_frames += 1
-                self.decoded_frames += 1
-            else:
-                decoded = self.decode(frame)
+                if deadline is not None and packet.clock > deadline:
+                    carried = packet
+                    raise TimeoutError
+            except TimeoutError:
+                if pending:
+                    await self.depth_control(depth, increment="rpc_timeout")
+                    pending = None
+                elif reset_deadline is not None:
+                    observed = Observation.now()
+                    async with self.publication():
+                        depth.invalidate("snapshot_timeout", observed)
+                        if self.journal:
+                            await self.journal.append("mbp_gap", observed.utc_ns, depth.gaps[-1])
+                    reset_deadline = None
+                continue
+            decoded = self.decode(packet.frame, observed=packet.observed)
             if decoded is None:
                 if self.journal:
                     await self.journal.append("rejected", self.state.last_any.utc_ns, {
@@ -272,11 +323,15 @@ class Collector:
             payload, observed, raw = decoded
             if "stream" in payload:
                 if self.journal and self.journal.batch_size > 1:
-                    carried = await self.process_market_batch(socket, decoded, gather=deadline is None)
+                    carried, closed = await self.process_market_batch(receive, decoded, gather=deadline is None)
+                    if closed:
+                        return
                 else:
                     async with self.publication():
                         await self.process(*decoded)
             elif pending and type(payload.get("id")) is int and payload["id"] == pending[0]:
+                self.recovery_receipt_ms = (packet.clock - pending[2]) * 1000
+                self.recovery_dispatch_ms = (loop.time() - packet.clock) * 1000
                 pending = None
                 try:
                     data = payload.get("result")
@@ -290,6 +345,17 @@ class Collector:
                 else:
                     async with self.publication():
                         await self.apply_book(event, "depth_snapshot", raw)
+                    self.recovery_publication_ms = (loop.time() - packet.clock) * 1000
+
+    def receiver_diagnostics(self):
+        return {
+            "incoming_frames": self.incoming_frames, "decoded_frames": self.decoded_frames,
+            "ingest_high_water_frames": self.ingest_high_water_frames,
+            "receive_queue_capacity": RECEIVE_QUEUE, "receive_queue_high_water": self.receive_high_water,
+            "receive_pressure_count": self.receive_pressure, "depthsnap_send_to_receipt_ms": self.recovery_receipt_ms,
+            "depthsnap_receipt_to_dispatch_ms": self.recovery_dispatch_ms,
+            "depthsnap_receipt_to_publication_ms": self.recovery_publication_ms,
+        }
 
     async def depth_control(self, depth, state=None, increment=None):
         async with self.publication():
@@ -303,29 +369,29 @@ class Collector:
                     "state": depth.state, "increment": {increment: 1} if increment else {},
                 })
 
-    async def process_market_batch(self, socket, first, *, gather):
+    async def process_market_batch(self, receive, first, *, gather):
         frames = [first]
         carried = None
-        started = asyncio.get_running_loop().time()
+        closed = False
+        end = asyncio.get_running_loop().time() + BATCH_RESIDENCE_SECONDS
         size = len(first[2].encode("utf-8"))
         try:
-            while gather and len(frames) < self.journal.batch_size:
-                remaining = started + BATCH_RESIDENCE_SECONDS - asyncio.get_running_loop().time()
-                if remaining <= 0:
-                    break
+            while gather and len(frames) < self.journal.batch_size and asyncio.get_running_loop().time() < end:
                 try:
-                    async with asyncio.timeout(remaining):
-                        frame = await socket.recv()
-                except (TimeoutError, ConnectionClosed):
+                    packet = await receive(end)
+                except TimeoutError:
                     break
-                # A control or invalid frame must retain order across the commit.
-                decoded = self.decode(frame, track=False)
+                if packet is None:
+                    closed = True
+                    break
+                frame = packet.frame
+                decoded = self.decode(frame, track=False, observed=packet.observed)
                 if decoded is None or "stream" not in decoded[0]:
-                    carried = (frame, decoded)
+                    carried = packet
                     break
                 size += len(frame.encode("utf-8"))
                 if size > MAX_BATCH_BYTES:
-                    carried = (frame, decoded)
+                    carried = packet
                     break
                 frames.append(decoded)
                 self.incoming_frames += 1
@@ -339,7 +405,7 @@ class Collector:
         if self.micro:
             published = Observation.now().monotonic_ns
             self.micro.availability_ns.extend(published - row[1].monotonic_ns for row in frames)
-        return carried
+        return carried, closed
 
     async def apply_book(self, event, kind, raw):
         depth = self.micro.depth
@@ -381,8 +447,8 @@ class Collector:
                 for card in cards:
                     await self.journal.append("evidence", observed.utc_ns, {"event_schema_version": 2, **card})
 
-    def decode(self, frame: str | bytes, *, track=True) -> tuple[dict, Observation, str] | None:
-        observed = Observation.now()
+    def decode(self, frame: str | bytes, *, track=True, observed=None) -> tuple[dict, Observation, str] | None:
+        observed = observed or Observation.now()
         if track:
             self.state.last_any = observed
             self.incoming_frames += 1

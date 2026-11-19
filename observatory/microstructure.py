@@ -135,7 +135,7 @@ class Microstructure:
             self.append("samples", (stamp, self.depth_eligible(stamp)))
         if self.last_intensity_check is None or stamp - self.last_intensity_check >= SECOND // 4:
             self.last_intensity_check = stamp
-            if stamp >= self.saturated_until.get("events", 0):
+            if stamp >= self.saturated_until.get("events", stamp):
                 rates = Counter(category for seen, category in self.events if seen >= stamp - SECOND)
                 if rates:
                     category, count = rates.most_common(1)[0]
@@ -228,7 +228,7 @@ class Microstructure:
         self.append("flow", (stamp, event.signed_size, event.size, event.price_ticks))
         signed = sum(row[1] for row in self.flow if row[0] >= stamp - SECOND)
         if abs(signed) >= BURST_CONTRACTS and (not self.active or self.active.terminal) and (
-            stamp >= self.saturated_until.get("flow", 0)
+            stamp >= self.saturated_until.get("flow", stamp)
         ):
             self.start_candidate(event, signed)
 
@@ -390,10 +390,10 @@ class Microstructure:
         buy = sum(max(0, signed) for _, signed, _, _ in flow)
         sell = sum(max(0, -signed) for _, signed, _, _ in flow)
         fresh_trade = self.last_trade_seen is not None and stamp - self.last_trade_seen <= self.freshness_ns
-        flow_full = active and fresh_trade and stamp - self.flow_coverage_since >= WINDOW and stamp >= self.saturated_until.get("flow", 0)
+        flow_full = active and fresh_trade and stamp - self.flow_coverage_since >= WINDOW and stamp >= self.saturated_until.get("flow", stamp)
         ofi = [row for row in self.ofi if row[0] >= stamp - WINDOW] if valid_depth else []
         ofi_full = valid_depth and self.depth_coverage_since is not None and (
-            stamp - self.depth_coverage_since >= WINDOW and stamp >= self.saturated_until.get("ofi", 0)
+            stamp - self.depth_coverage_since >= WINDOW and stamp >= self.saturated_until.get("ofi", stamp)
         )
         top = self.depth.top() if valid_depth else [[], []]
         totals = [sum(level[1] for level in side) for side in top]
@@ -462,7 +462,7 @@ class Microstructure:
                 "cohort_survival": self.orders.survival(stamp) if order_fresh else None,
                 "added_size_sample": list(self.orders.added_sizes)[-12:] if order_fresh else None,
             },
-            "intensity": {"status": "VALID" if flow_full and stamp >= self.saturated_until.get("events", 0) else "PARTIAL",
+            "intensity": {"status": "VALID" if flow_full and stamp >= self.saturated_until.get("events", stamp) else "PARTIAL",
                           "rates_per_second": {key: count / 2 for key, count in counts.items()}},
             "evidence": list(self.cards)[-8:],
         }

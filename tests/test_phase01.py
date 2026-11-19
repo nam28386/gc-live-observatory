@@ -73,10 +73,17 @@ def test_live_adapter_reads_synthetic_vendor_socket_and_local_history(tmp_path):
                 assert data["status"]["last_ack_request_id"] == 1
                 assert data["status"]["last_bbo_change"] is None
                 assert data["status"]["last_volume_update"] == data["status"]["last_bbo_message"]
-                assert data["status"]["last_oi_update"] != data["status"]["last_volume_update"]
+                assert data["status"]["counters"]["volume_updates"] == 2
+                assert data["status"]["counters"]["oi_updates"] == 1
                 rows = client.get("/api/history").json()["records"]
                 assert [row["kind"] for row in rows][:2] == ["ack", "bbo"]
                 assert rows[-1]["kind"] == "trade"
+                first, second = [row for row in rows if row["kind"] == "bbo"]
+                assert first["id"] < second["id"]
+                assert first["payload"]["event"]["open_interest_time_us"] == second["payload"]["event"]["open_interest_time_us"]
+                assert first["payload"]["event"]["volume_time_us"] != second["payload"]["event"]["volume_time_us"]
+                assert data["status"]["last_oi_update"] == first["payload"]["event"]["observed"]
+                assert data["status"]["last_volume_update"] == second["payload"]["event"]["observed"]
                 assert any(row["payload"].get("reason") == "future_trade_time" for row in rows)
                 assert json.loads(rows[-1]["payload"]["raw"])["data"]["T"] == fixture.trade(0)["T"]
                 assert len(client.get("/api/history?limit=1").json()["records"]) == 1

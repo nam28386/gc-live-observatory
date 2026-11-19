@@ -199,6 +199,7 @@ class ObservatoryState:
             ):
                 self.volume = value
                 self.last_volume_update = ticker.observed
+                self.counters["volume_updates"] += 1
         if ticker.open_interest_valid:
             value = (ticker.open_interest, ticker.open_interest_time_us)
             if self.oi is not None:
@@ -209,6 +210,7 @@ class ObservatoryState:
             if self.oi != value:
                 self.oi = value
                 self.last_oi_update = ticker.observed
+                self.counters["oi_updates"] += 1
 
     def freshness(self, received: Observation | None, now: Observation) -> str:
         if not self.connected:

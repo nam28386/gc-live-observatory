@@ -120,8 +120,7 @@ def create_app(
         snapshot = source_state.snapshot(now) if full else {"status": source_state.status(now)}
         status = snapshot["status"]
         agent = app.state.collector
-        status["receiver"] = {"incoming_frames": agent.incoming_frames, "decoded_frames": agent.decoded_frames,
-                              "ingest_high_water_frames": agent.ingest_high_water_frames}
+        status["receiver"] = agent.receiver_diagnostics()
         status["market_data_mode"] = micro.mode
         status["requested_market_data_mode"] = requested_mode
         status["mbp_status"] = "INVALID" if failed else micro.depth.state if micro.depth else "DISABLED"

@@ -277,12 +277,12 @@ def test_hgc_live_and_replay_agree_after_virtual_cutoff_and_outcome(tmp_path, mo
 
     # The real socket carries deterministic receive-clock offsets solely in this
     # fixture. Production collector observation and source clocks remain distinct.
-    origin = time.monotonic_ns() - 50 * 10**9
+    origin = 10**9
     origin_utc = time.time_ns() - 50 * 10**9
     decode = Collector.decode
 
-    def fixture_decode(self, frame, *, track=True):
-        result = decode(self, frame, track=track)
+    def fixture_decode(self, frame, *, track=True, observed=None):
+        result = decode(self, frame, track=track, observed=observed)
         if result is None:
             return None
         payload, stamp, raw = result
@@ -293,6 +293,13 @@ def test_hgc_live_and_replay_agree_after_virtual_cutoff_and_outcome(tmp_path, mo
         return payload, stamp, raw
 
     monkeypatch.setattr(Collector, "decode", fixture_decode)
+
+    class SnapshotClock:
+        @staticmethod
+        def now():
+            return Observation(origin_utc + 32 * 10**9, origin + 32 * 10**9)
+
+    monkeypatch.setattr("observatory.web.Observation", SnapshotClock)
 
     class CandidateTape(MockGateway):
         async def publish(self, socket):

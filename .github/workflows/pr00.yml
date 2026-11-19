@@ -2,7 +2,7 @@ name: Observatory synthetic validation
 
 on:
   push:
-    branches: [main, feat/phase01-live-ready, feat/phase02-microstructure-engine, feat/phase03-live-capture-reliability]
+    branches: [main, feat/phase01-live-ready, feat/phase02-microstructure-engine, feat/phase03-live-capture-reliability, feat/phase04-live-wave-research]
   pull_request:
 
 permissions:
