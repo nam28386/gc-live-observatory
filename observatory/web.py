@@ -1,6 +1,7 @@
 """Loopback FastAPI app wired to the synthetic gateway and collector."""
 
 import asyncio
+import platform
 from functools import lru_cache
 import subprocess
 from contextlib import AsyncExitStack, asynccontextmanager, suppress
@@ -57,7 +58,7 @@ def create_app(
         "source": state.source, "exchange": instrument.exchange,
         "symbol": instrument.symbol, "expiry": instrument.expiry,
         "measurement_schema_version": 4, "stale_after_ns": state.stale_after_ns,
-        "software_revision": software_revision(), "instrument_registry": instrument_registry,
+        "software_revision": software_revision(), "producer_os": platform.system(), "instrument_registry": instrument_registry,
         "timestamp_contract": "utc_ns and process monotonic_ns; source clocks per instrument contract",
         "capture_config": {"mode": mode, "batch_size": batch_size, "durability": "SQLite WAL FULL",
                            "retention_days": retention_days, "batch_residence_ms": 4},
@@ -97,6 +98,10 @@ def create_app(
                     conclusion = summarize(state, ended, micro, now, started, calendar,
                                            journal.diagnostics(now.monotonic_ns))
                     conclusion["freshness_samples"] = app.state.collector.freshness_samples
+                    conclusion["receiver"] = app.state.collector.receiver_diagnostics()
+                    conclusion["recorder"] = journal.diagnostics(now.monotonic_ns)
+                    conclusion["committed_market_records"] = journal.market_records
+                    conclusion["effective_mode"] = micro.mode
                     await journal.append("capture_summary", now.utc_ns, conclusion)
 
     async def current_snapshot(*, full: bool) -> dict:

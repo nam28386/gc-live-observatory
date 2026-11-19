@@ -171,3 +171,41 @@ def test_correlated_rpc_outcomes_and_permanent_gap(reply, expected, attempts, tm
                     await task
 
     asyncio.run(scenario())
+
+
+def test_snapshot_commit_failure_does_not_publish_or_claim_application(tmp_path):
+    import sqlite3
+
+    async def scenario():
+        journal = Journal(tmp_path / "failure.sqlite", {}, batch_size=8)
+        write = journal.write_records
+
+        def fail_on_snapshot(records):
+            if any(row[0] == "depth_snapshot" for row in records):
+                raise sqlite3.OperationalError("synthetic commit fault")
+            return write(records)
+
+        journal.write_records = fail_on_snapshot
+
+        async def gateway(socket):
+            await seed(socket)
+            rpc = json.loads(await socket.recv())
+            await socket.send(json.dumps({"id": rpc["id"],
+                                          "result": {"type": "Image", "gen": 1, "seq": 2, "src": 1, "rows": []}}))
+            await socket.wait_closed()
+
+        state = ObservatoryState(MOCK_GC)
+        micro = Microstructure("B", MOCK_GC, "fxaurum_mock")
+        async with journal.running(), serve(gateway, "127.0.0.1", 0) as listener:
+            endpoint = f"ws://127.0.0.1:{listener.sockets[0].getsockname()[1]}/"
+            collector = Collector(endpoint, state, micro=micro, journal=journal)
+            await asyncio.wait_for(collector.run(), 10)
+            rpc = collector.rpc.view()
+            assert rpc["counts"]["RPC_COMMIT_FAILURE"] == 1
+            assert "RESPONSE_COMMITTED" not in rpc["recent"][-1]["stages_ms"]
+            assert rpc["active"] is None
+            assert state.recorder_error and journal.publication_failed
+            rows = journal.history()
+            assert not any(row["kind"] in ("depth_snapshot", "mbp_recovery") for row in rows)
+            assert any(row["kind"] == "mbp_gap" for row in rows)
+    asyncio.run(scenario())

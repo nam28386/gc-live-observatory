@@ -27,6 +27,7 @@ class Journal:
         self.retention_days = retention_days
         self.session = uuid4().hex
         self.written = 0
+        self.market_records = 0
         self.failures = 0
         self.next_prune = 0
         self.batch_size = batch_size
@@ -205,6 +206,7 @@ class Journal:
             self.last_record_id = position
             self.last_commit_ns = committed
             self.written += sum(1 + (record[3] is not None) for record in records)
+            self.market_records += sum(record[0] in ("trade", "bbo", "mbp", "mbo") for record in records)
             self.transactions += 1
             self.commit_latency_ns.extend(committed - record[4] for record in records if record[4] is not None)
 

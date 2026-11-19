@@ -69,6 +69,8 @@ def test_every_canvas_updates_from_mock_websocket_and_gap_is_visible(app_url, mo
         expect(page.get_by_label("Capture operations")).to_be_visible()
         expect(page.locator("#ops-capture")).to_contain_text("backlog")
         expect(page.locator("#ops-session")).to_contain_text("UNKNOWN")
+        expect(page.locator("#ops-mode")).to_have_text(mode + " → " + mode)
+        expect(page.locator("#ops-queue")).to_contain_text("/64")
         expect(page.locator("#ops-latency")).to_contain_text("p95")
         expect(page.locator("#ack")).to_have_text(f"Acknowledged #{3 if mode == 'C' else 2}", timeout=10_000)
         expect(page.locator("#gaps")).to_have_text("1 · historical gaps retained")
@@ -83,6 +85,7 @@ def test_every_canvas_updates_from_mock_websocket_and_gap_is_visible(app_url, mo
             page.locator("summary").filter(has_text="Evidence cards").click()
             expect(page.locator("#evidence-card")).to_contain_text("MEASUREMENT")
             expect(page.get_by_label("Wave hierarchy")).to_contain_text("M15")
+            expect(page.locator("#ops-rpc")).to_contain_text("SNAPSHOT_APPLIED")
             page.get_by_text("Investigate a wave", exact=True).click()
             expect(page.locator("#wave-card")).to_contain_text("EXPECTED_RESPONSE_UNAVAILABLE")
         else:

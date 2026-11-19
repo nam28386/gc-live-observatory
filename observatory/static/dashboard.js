@@ -152,6 +152,17 @@ function update(snapshot) {
   const latencies = recorder.observation_to_commit_us;
   show("ops-latency", latencies?.p95 != null ? "p50 " + (latencies.p50 / 1000).toFixed(1) +
     " · p95 " + (latencies.p95 / 1000).toFixed(1) + " · p99 " + (latencies.p99 / 1000).toFixed(1) + " ms" : "UNAVAILABLE");
+  const receiver = status.receiver;
+  show("ops-mode", status.requested_market_data_mode + " → " + status.market_data_mode);
+  show("ops-queue", receiver.receiver_queue_occupancy + "/" + receiver.receive_queue_capacity +
+    " · high " + receiver.receive_queue_high_water + " · uncertain ≥" + receiver.uncertain_received_frames);
+  const rpc = receiver.depthsnap_rpc;
+  const lastRpc = rpc?.recent.at(-1);
+  const renderMs = value => value == null ? "—" : value.toFixed(1) + " ms";
+  show("ops-rpc", (rpc?.active ? Object.keys(rpc.active.stages_ms).at(-1) :
+    lastRpc?.outcomes.at(-1) || "No request observed") +
+    " · receipt " + renderMs(receiver.depthsnap_send_to_receipt_ms) +
+    " · publish " + renderMs(receiver.depthsnap_receipt_to_publication_ms));
   show("ops-research", quality.research_eligibility + " · " + quality.invalid_feature_windows +
     " invalid windows" + (quality.missing_sources.length ? " · missing " + quality.missing_sources.join(", ") : ""));
   show("recorder", status.recorder_error ? "Capture failed · collector stopped" :

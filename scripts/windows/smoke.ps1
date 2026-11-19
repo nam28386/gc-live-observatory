@@ -4,12 +4,31 @@ param(
     [int]$GatewayPort = 9001,
     [int]$Port = 8000,
     [ValidateSet("A", "B", "C")][string]$Mode = "A",
-    [ValidateRange(1,120)][int]$TimeoutSeconds = 45
+    [ValidateRange(1,120)][int]$TimeoutSeconds = 45,
+    [string]$DiagnosticPath,
+    [switch]$ExpiryAttested
 )
 $ErrorActionPreference = 'Stop'
 & (Join-Path $PSScriptRoot 'preflight.ps1') -GatewayPort $GatewayPort -Port $Port -Running
 $url = "http://127.0.0.1:$Port/api/snapshot"
 $initial = Invoke-RestMethod $url -TimeoutSec 3
+function Save-PilotDiagnostic {
+    if (!$DiagnosticPath) { return }
+    $target = [System.IO.Path]::GetFullPath($DiagnosticPath)
+    if (Test-Path -LiteralPath $target) { throw 'Diagnostic report path already exists' }
+    $diagnoseArgs = @('run', '--locked', 'python', '-m', 'observatory.diagnose',
+        '--port', "$Port", '--gateway-port', "$GatewayPort", '--require-mode', $Mode, '--output', $target)
+    if ($ExpiryAttested) { $diagnoseArgs += '--expiry-verified' }
+    Push-Location (Join-Path $PSScriptRoot '../..')
+    try {
+        uv @diagnoseArgs
+        if (!(Test-Path -LiteralPath $target)) {
+            throw 'Diagnostic report could not be saved. Use a new local path outside Git.'
+        }
+    } finally {
+        Pop-Location
+    }
+}
 $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
 do {
     $data = Invoke-RestMethod $url -TimeoutSec 3
@@ -45,9 +64,15 @@ do {
             ($null -ne $data.trade.gateway_receive_ms -and [long]$data.trade.gateway_receive_ms -lt 1000000000000)) {
             throw 'Trade source clock is outside expected bounds. Verify clock synchronization and feed latency.'
         }
+        Save-PilotDiagnostic
         Write-Output "PASS COMEX $Symbol expiry $Expiry, ACK #$($s.request_id), fresh eligible Trade and BBO"
         return
     }
     Start-Sleep -Milliseconds 300
 } while ((Get-Date) -lt $deadline)
-throw 'Timed out waiting for live Trade and BBO in an active session'
+Save-PilotDiagnostic
+$rpc = $s.receiver.depthsnap_rpc.recent | Select-Object -Last 1
+$outcome = if ($rpc) { $rpc.outcomes -join ',' } else { 'none' }
+throw ("Pilot readiness timed out: trade={0}, bbo={1}, mbp={2}, effective={3}, rpc={4}, uncertain={5}" -f
+    $s.trade_freshness, $s.bbo_freshness, $s.mbp_status, $s.market_data_mode, $outcome,
+    $s.receiver.uncertain_received_frames)

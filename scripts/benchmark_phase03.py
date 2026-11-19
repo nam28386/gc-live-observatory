@@ -6,6 +6,7 @@ from collections import Counter
 from contextlib import closing
 import json
 from pathlib import Path
+import platform
 import sqlite3
 from tempfile import TemporaryDirectory
 import time
@@ -90,6 +91,35 @@ class Workload(MockGateway):
         await socket.wait_closed()
 
 
+
+def peak_rss():
+    if platform.system() != "Windows":
+        import resource
+        return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss, (
+            "bytes" if platform.system() == "Darwin" else "KiB"
+        )
+    import ctypes
+    from ctypes import wintypes
+
+    class MemoryCounters(ctypes.Structure):
+        _fields_ = [("cb", wintypes.DWORD), ("PageFaultCount", wintypes.DWORD)] + [
+            (name, ctypes.c_size_t) for name in (
+                "PeakWorkingSetSize", "WorkingSetSize", "QuotaPeakPagedPoolUsage", "QuotaPagedPoolUsage",
+                "QuotaPeakNonPagedPoolUsage", "QuotaNonPagedPoolUsage", "PagefileUsage", "PeakPagefileUsage",
+            )
+        ]
+
+    handle = ctypes.windll.kernel32.GetCurrentProcess
+    handle.restype = wintypes.HANDLE
+    read = ctypes.windll.psapi.GetProcessMemoryInfo
+    read.restype = wintypes.BOOL
+    read.argtypes = wintypes.HANDLE, ctypes.POINTER(MemoryCounters), wintypes.DWORD
+    state = MemoryCounters()
+    state.cb = ctypes.sizeof(state)
+    if not read(handle(), ctypes.byref(state), state.cb):
+        raise OSError("Windows working-set measurement failed")
+    return state.PeakWorkingSetSize, "bytes"
+
 def run(args, path, **options):
     source = Workload(args.mode, args.cycles, args.levels, args.pace, args.burst, args.reconnect_every, args.gap_every)
     cpu_start = time.process_time()
@@ -131,15 +161,18 @@ def run(args, path, **options):
         "incoming_frames_per_second": round(expected / (source.send_ended - source.send_started)),
         "durable_market_events_per_second": round(expected / elapsed),
         "api_completion_seconds": round(elapsed, 3), "cpu_seconds": round(time.process_time() - cpu_start, 3),
-        "database_bytes": path.stat().st_size, "rejected": durable.get("rejected", 0),
+        "database_bytes": path.stat().st_size, "database_growth_bytes_per_second": round(path.stat().st_size / elapsed),
+        "received_frames_per_second": round(status["receiver"]["socket_received_frames"] / elapsed),
+        "durable_records_per_second": round(status["recorder"]["durable_events"] / elapsed),
+        "rejected": durable.get("rejected", 0), "producer_os": platform.system(),
         "recorder": status["recorder"], "diagnostics": snapshot["microstructure"]["diagnostics"],
     }
-    try:
-        import resource
-        result["peak_process_rss"] = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
-        result["rss_unit"] = "KiB on Linux; bytes on macOS"
-    except ImportError:
-        pass
+    result["peak_process_rss"], result["rss_unit"] = peak_rss()
+    result["capacity"] = {
+        "TESTED_SYNTHETIC_CAPACITY": "OBSERVED_SHORT_WORKLOAD",
+        "TESTED_LOCAL_WINDOWS_CAPACITY": "OBSERVED_SYNTHETIC" if platform.system() == "Windows" else "UNVERIFIED",
+        "OBSERVED_REAL_CAPTURE_RATE": "UNVERIFIED", "UNVERIFIED_PRODUCTION_CAPACITY": True,
+    }
     assert reprocessed["records_processed"] == sum(durable.values())
     return result
 

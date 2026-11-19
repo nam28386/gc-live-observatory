@@ -71,7 +71,10 @@ class Collector:
         self.rpc = SnapshotRPC()
         self.rpc_transport_outcome = "RPC_TRANSPORT_INTERRUPTED"
         self.received_frames = 0
+        self.pre_ack_buffered_frames = 0
         self.admitted_frames = 0
+        self.accounted_queue_frames = 0
+        self.connection_uncertain_base = 0
         self.queue_residence_ns = deque(maxlen=4096)
         self.queue_arrivals = deque()
         self.normalized_market_frames = 0
@@ -102,6 +105,7 @@ class Collector:
                 ) as socket:
                     self.next_request_id += 1
                     self.connection_epoch += 1
+                    self.connection_uncertain_base = self.uncertain_receipts
                     self.state.on_connect(self.next_request_id)
                     await self.subscribe(socket, self.next_request_id)
                     delay = self.retry_delay
@@ -173,7 +177,8 @@ class Collector:
         if capture_interrupted and self.journal and not self.state.recorder_error:
             await self.journal.append("gap", observed.utc_ns, {
                 "reason": reason, "request_id": self.state.request_id, "observed": observed.wire(),
-                "receiver_uncertain_min": self.uncertain_receipts,
+                "receiver_uncertain_min": self.uncertain_receipts - self.connection_uncertain_base,
+                "receiver_uncertain_total": self.uncertain_receipts,
             })
         if not self.state.recorder_error:
             await self.persist_cards(observed)
@@ -236,17 +241,20 @@ class Collector:
         # Socket receipt keeps progressing across recorder awaits. The consumer
         # still applies every frame in original wire order, including RPC images.
         queue = asyncio.Queue(RECEIVE_QUEUE)
-        admitted = 0
+        admitted_before = self.admitted_frames
+        accounted_before = self.accounted_queue_frames
+        received_unadmitted = False
         loop = asyncio.get_running_loop()
 
         async def receiver():
-            nonlocal admitted
+            nonlocal received_unadmitted
             terminal = None
             try:
                 while True:
                     raw = await socket.recv()
                     frame = Received(raw, loop.time(), Observation.now())
                     self.received_frames += 1
+                    received_unadmitted = True
                     match = self.observe_rpc_receipt(frame)
                     if queue.full():
                         self.receive_pressure += 1
@@ -258,11 +266,12 @@ class Collector:
                         match.queued = loop.time()
                         self.rpc.mark("RESPONSE_QUEUED", match.queued)
                     self.queue_arrivals.append(frame.clock)
-                    admitted += 1
+                    received_unadmitted = False
                     self.admitted_frames += 1
                     self.receive_high_water = max(self.receive_high_water, queue.qsize())
             except TimeoutError:
                 self.uncertain_receipts += 1
+                received_unadmitted = False
                 terminal = SubscriptionFailure("local_receive_backpressure")
             except ConnectionClosed as exc:
                 if not exc.rcvd or exc.rcvd.code not in (1000, 1001):
@@ -272,7 +281,6 @@ class Collector:
             await queue.put(terminal)
 
         async def receive(deadline=None):
-            nonlocal admitted
             if not queue.empty():
                 item = queue.get_nowait()
             elif deadline is None:
@@ -283,7 +291,6 @@ class Collector:
             if isinstance(item, Exception):
                 raise item
             if isinstance(item, Received):
-                admitted -= 1
                 self.queue_arrivals.popleft()
                 self.queue_residence_ns.append(round((loop.time() - item.clock) * 1e9))
             return item
@@ -299,7 +306,13 @@ class Collector:
         finally:
             reader.cancel()
             await asyncio.gather(reader, return_exceptions=True)
-            self.uncertain_receipts += admitted
+            # Account also for a dequeued lookahead or a cancelled transaction,
+            # not just frames still resident in the underlying queue.
+            self.uncertain_receipts += (
+                self.admitted_frames - admitted_before
+                - (self.accounted_queue_frames - accounted_before)
+                + received_unadmitted
+            )
             self.queue_arrivals.clear()
 
     def observe_rpc_receipt(self, packet):
@@ -406,6 +419,7 @@ class Collector:
                     await self.journal.append("rejected", self.state.last_any.utc_ns, {
                         "reason": "malformed_frame", "observed": self.state.last_any.wire(),
                     })
+                self.accounted_queue_frames += 1
                 continue
             payload, observed, raw = decoded
             if "stream" in payload:
@@ -417,10 +431,14 @@ class Collector:
                     async with self.publication():
                         await self.process(*decoded)
                     self.visible_market_frames = self.normalized_market_frames
+                    self.accounted_queue_frames += 1
             elif pending and type(payload.get("id")) is int and payload["id"] == pending.request_id:
                 await self.handle_snapshot(depth, pending, packet, payload, observed, raw)
-            elif type(payload.get("id")) is int:
-                self.rpc.counts["UNMATCHED_RESPONSE"] += 1
+                self.accounted_queue_frames += 1
+            else:
+                if type(payload.get("id")) is int:
+                    self.rpc.counts["UNMATCHED_RESPONSE"] += 1
+                self.accounted_queue_frames += 1
 
     async def handle_snapshot(self, depth, request, packet, payload, observed, raw):
         loop = asyncio.get_running_loop()
@@ -472,6 +490,9 @@ class Collector:
         return {
             "incoming_frames": self.incoming_frames, "decoded_frames": self.decoded_frames,
             "socket_received_frames": self.received_frames, "admitted_queue_frames": self.admitted_frames,
+            "pre_ack_buffered_frames": self.pre_ack_buffered_frames,
+            "settled_queue_frames": self.accounted_queue_frames,
+            "durable_market_records": self.journal.market_records if self.journal else None,
             "normalized_market_frames": self.normalized_market_frames,
             "visible_market_frames": self.visible_market_frames,
             "receiver_queue_occupancy": len(self.queue_arrivals),
@@ -537,6 +558,7 @@ class Collector:
                     self.state.last_any = decoded[1]
                     await self.process(*decoded)
         self.visible_market_frames = self.normalized_market_frames
+        self.accounted_queue_frames += len(frames)
         if self.micro:
             published = Observation.now().monotonic_ns
             self.micro.availability_ns.extend(published - row[1].monotonic_ns for row in frames)
