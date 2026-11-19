@@ -1,5 +1,6 @@
 from decimal import Decimal
 import json
+import time
 
 from fastapi.testclient import TestClient
 import pytest
@@ -161,19 +162,40 @@ def test_hgc_gap_stays_ineligible_after_recovery():
     assert engine.snapshot(stamp(1.6))["ofi"]["status"] == "PARTIAL"
 
 
+def await_snapshot(client, predicate):
+    # Wait for the observable barrier, independently of the dashboard's
+    # publication cadence, timer precision and recorder filesystem latency.
+    deadline = time.monotonic() + 12
+    while True:
+        data = client.get("/api/snapshot").json()
+        if predicate(data):
+            return data
+        if time.monotonic() >= deadline:
+            pytest.fail(f"Capture did not reach expected barrier: {data['status']}, {data['microstructure']['mbp']}")
+        time.sleep(0.025)
+
+
 @pytest.mark.parametrize("mode", ["A", "B", "C"])
 def test_actual_mock_websocket_to_api_with_modes_and_durable_recovery(mode, tmp_path):
     with TestClient(create_app(mode=mode, interval=0.01, capture_path=tmp_path / "p2.sqlite")) as client:
+        def ready(data):
+            micro = data["microstructure"]
+            if not data["trade"]:
+                return False
+            if mode == "A":
+                return True
+            if micro["mbp"]["status"] != "VALID_BOOK" or not micro["mbp"]["counts"].get("recoveries"):
+                return False
+            records = client.get("/api/history?gaps=true").json()["records"]
+            if not any(record["kind"] == "mbp_recovery" for record in records):
+                return False
+            counts = micro["mbo"]["counts"] or {}
+            return mode != "C" or counts.get("exact_fill") and counts.get("inferred_fill")
+
+        await_snapshot(client, ready)
         with client.websocket_connect("/ws") as ws:
-            for _ in range(18):
-                data = ws.receive_json()
-                micro = data["microstructure"]
-                if data["trade"] and (
-                    mode == "A" or micro["mbp"]["counts"].get("recoveries", 0) > 0
-                ):
-                    break
-            else:
-                pytest.fail("No initialized or recovered mode")
+            data = ws.receive_json()
+        micro = data["microstructure"]
         assert all(data["candles"].values())
         assert data["status"]["market_data_mode"] == mode
         if mode != "A":
@@ -216,13 +238,12 @@ def test_replay_uses_durable_order_and_preserves_gap_after_recovery(tmp_path):
 
     database = tmp_path / "replay.sqlite"
     with TestClient(create_app(mode="C", interval=0.01, capture_path=database)) as client:
-        with client.websocket_connect("/ws") as ws:
-            for _ in range(16):
-                data = ws.receive_json()
-                if data["microstructure"]["mbp"]["counts"].get("recoveries"):
-                    break
-            else:
-                pytest.fail("No durable depth recovery")
+        data = await_snapshot(client, lambda item: (
+            item["microstructure"]["mbp"]["counts"].get("recoveries")
+            and (item["microstructure"]["mbo"]["counts"] or {}).get("exact_fill")
+            and any(row["kind"] == "mbp_recovery"
+                    for row in client.get("/api/history?gaps=true").json()["records"])
+        ))
         session = data["status"]["recorder"]["session_id"]
         first = replay(database, session, "C", 200)
         # Read the exact same immutable prefix even while the recorder progresses.

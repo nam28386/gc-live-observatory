@@ -65,7 +65,7 @@ class MockGateway:
                     and type(request_id) in (str, int)
                     and params == {"exchange": self.instrument.exchange, "symbol": self.instrument.symbol}
                 ):
-                    await socket.send(json.dumps({"id": request_id, "result": self.image(1)}))
+                    await self.reply_snapshot(socket, request_id)
                     continue
                 if (
                     request.get("method") != "SUBSCRIBE"
@@ -81,10 +81,21 @@ class MockGateway:
                 await socket.send(json.dumps(response))
                 if "result" in response and publisher is None:
                     publisher = asyncio.create_task(self.publish(socket))
+        except ConnectionClosed:
+            # The peer may leave while an ACK or recovery reply is being sent.
+            return
+        except OSError as exc:
+            # Windows Proactor can surface an aborted peer connection before
+            # websockets translates it into ConnectionClosed.
+            if getattr(exc, "winerror", None) not in (64, 995, 10053, 10054):
+                raise
         finally:
             if publisher is not None:
                 publisher.cancel()
                 await asyncio.gather(publisher, return_exceptions=True)
+
+    async def reply_snapshot(self, socket, request_id):
+        await socket.send(json.dumps({"id": request_id, "result": self.image(1)}))
 
     @staticmethod
     def request(frame: str | bytes) -> dict:
