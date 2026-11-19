@@ -76,6 +76,8 @@ def test_every_canvas_updates_from_mock_websocket_and_gap_is_visible(app_url, mo
             expect(page.locator("#micro-mbo")).to_contain_text("SYNTHETIC")
             expect(page.locator("#timeline-entries")).to_contain_text("MBP snapshot recovered")
             expect(page.locator("#micro-ofi")).to_contain_text("VALID")
+            page.get_by_text("Evidence cards", exact=False).click()
+            expect(page.locator("#evidence-card")).to_contain_text("MEASUREMENT")
         else:
             expect(page.locator("#micro-mbo")).to_have_text("DISABLED · DISABLED")
         canvases = page.locator("canvas")
